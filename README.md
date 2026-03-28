@@ -84,6 +84,25 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Auto-Restart (systemd)
+
+For VPS reliability, run the gateway as a systemd service with automatic restart.
+
+```bash
+cd /home/opencode/mcp-gateway
+sudo cp deploy/systemd/opencode-mcp-gateway.service /etc/systemd/system/opencode-mcp-gateway.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now opencode-mcp-gateway
+sudo systemctl status opencode-mcp-gateway --no-pager
+```
+
+Useful commands:
+
+```bash
+sudo systemctl restart opencode-mcp-gateway
+sudo journalctl -u opencode-mcp-gateway -n 100 --no-pager
+```
+
 ## Configuration
 
 | Variable | Default | Description |

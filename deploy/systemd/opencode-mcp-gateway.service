@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenCode MCP Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opencode
+Group=opencode
+WorkingDirectory=/home/opencode/mcp-gateway
+EnvironmentFile=/home/opencode/mcp-gateway/.env
+Environment=OPENCODE_HOST=localhost
+Environment=OPENCODE_PORT=9999
+Environment=GATEWAY_PORT=3001
+Environment=ENABLE_RAW_BASH=true
+ExecStart=/home/opencode/mcp-gateway/.venv/bin/python /home/opencode/mcp-gateway/main.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
