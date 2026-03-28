@@ -134,7 +134,7 @@ class TestOpenCodeClient:
         result = await client.send_message("s1", "Hello", model="openai/gpt-4o")
         
         call_args = client.client.post.call_args
-        assert call_args[1]["json"]["model"] == {"providerID": "openai/gpt-4o"}
+        assert call_args[1]["json"]["model"] == {"providerID": "openai", "modelID": "gpt-4o"}
 
     @pytest.mark.asyncio
     async def test_stream_message(self, client):
