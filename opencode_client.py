@@ -63,12 +63,14 @@ class OpenCodeClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def create_session(self, title: Optional[str] = None, directory: Optional[str] = None) -> dict:
+    async def create_session(self, title: Optional[str] = None, directory: Optional[str] = None, permissions: Optional[list] = None) -> dict:
         payload = {}
         if title:
             payload["title"] = title
         if directory:
             payload["directory"] = directory
+        if permissions:
+            payload["permission"] = permissions
         resp = await self.client.post("/session", json=payload)
         resp.raise_for_status()
         return resp.json()
@@ -96,7 +98,7 @@ class OpenCodeClient:
 
     async def stream_message(self, session_id: str, prompt: str, model: Optional[str] = None) -> AsyncIterator[dict]:
         payload = {
-            "parts": [{"type": "text", "text": prompt}],
+            "parts": [{"type": "text", "text": text}],
             "agent": "default",
         }
         if model:
@@ -150,5 +152,16 @@ class OpenCodeClient:
 
     async def close_pty(self, pty_id: str) -> dict:
         resp = await self.client.delete(f"/pty/{pty_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_session(self, session_id: str, **kwargs) -> dict:
+        """Update session properties.
+        
+        Args:
+            session_id: The session ID
+            **kwargs: Properties to update (title, permission, etc.)
+        """
+        resp = await self.client.patch(f"/session/{session_id}", json=kwargs)
         resp.raise_for_status()
         return resp.json()
