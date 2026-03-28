@@ -288,6 +288,146 @@ class TestSessionManager:
         finally:
             sm.NEAR_TIMEOUT_THRESHOLD = original_threshold
 
+    @pytest.mark.asyncio
+    async def test_ensure_session_uses_active_session(self, session_manager, mock_opencode_client):
+        """Test ensure_session prefers active session when set."""
+        session_manager.active_session_id = "active-session"
+
+        result = await session_manager.ensure_session()
+
+        assert result == "active-session"
+        mock_opencode_client.create_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_session_creates_fallback_session(self, session_manager, mock_opencode_client):
+        """Test ensure_session creates session when none are available."""
+        mock_opencode_client.list_sessions = AsyncMock(return_value=[])
+        mock_opencode_client.create_session = AsyncMock(return_value={"id": "shell-session"})
+
+        result = await session_manager.ensure_session()
+
+        assert result == "shell-session"
+        assert session_manager.active_session_id == "shell-session"
+        assert session_manager.get_session_mode("shell-session") == "building"
+        mock_opencode_client.create_session.assert_called_once_with(title="Raw Bash Session")
+
+    @pytest.mark.asyncio
+    async def test_run_shell_command(self, session_manager, mock_opencode_client):
+        """Test raw shell command execution response parsing."""
+        session_id = "test-session-1"
+        session_manager.active_session_id = session_id
+        session_manager.session_modes[session_id] = "building"
+
+        mock_opencode_client.run_shell = AsyncMock(return_value={
+            "info": {
+                "id": "msg-1",
+                "time": {"completed": 1234567890},
+            },
+            "parts": [
+                {
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "echo shell_ok"},
+                        "output": "shell_ok\n",
+                        "metadata": {"output": "shell_ok\n"},
+                    },
+                }
+            ],
+        })
+
+        result = await session_manager.run_shell_command(
+            command="echo shell_ok",
+            session_id=session_id,
+            workdir="/tmp",
+            timeout_seconds=30,
+            description="smoke",
+        )
+
+        assert result["session_id"] == session_id
+        assert result["message_id"] == "msg-1"
+        assert result["output"] == "shell_ok"
+        assert result["tool_status"] == "completed"
+        assert result["agent"] == "build"
+        assert result["mode"] == "building"
+        assert "timeout 30s" in result["executed_command"]
+        assert "cd /tmp" in result["executed_command"]
+
+    @pytest.mark.asyncio
+    async def test_list_pending_questions(self, session_manager, mock_opencode_client):
+        """Test listing pending questions with session filter."""
+        mock_opencode_client.list_questions = AsyncMock(return_value=[
+            {
+                "id": "q1",
+                "sessionID": "test-session-1",
+                "questions": [
+                    {
+                        "header": "Confirm",
+                        "question": "Proceed?",
+                        "options": [{"label": "Yes", "description": "Continue"}],
+                    }
+                ],
+            },
+            {
+                "id": "q2",
+                "sessionID": "other-session",
+                "questions": [],
+            },
+        ])
+
+        result = await session_manager.list_pending_questions(session_id="test-session-1")
+
+        assert result["count"] == 1
+        assert result["questions"][0]["request_id"] == "q1"
+        assert result["needs_human_input"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_message_includes_pending_inputs(self, session_manager, mock_opencode_client):
+        """Test send_message surfaces pending question queue metadata."""
+        mock_opencode_client.send_message = AsyncMock(return_value={
+            "info": {"id": "m1", "time": {"completed": 1}},
+            "parts": [{"type": "text", "text": "done"}],
+        })
+        mock_opencode_client.list_questions = AsyncMock(return_value=[
+            {
+                "id": "q1",
+                "sessionID": "test-session-1",
+                "questions": [
+                    {
+                        "header": "Select",
+                        "question": "Pick one",
+                        "options": [{"label": "A", "description": "Option A"}],
+                    }
+                ],
+            }
+        ])
+        mock_opencode_client.list_permissions = AsyncMock(return_value=[])
+
+        result = await session_manager.send_message("test-session-1", "Hi")
+
+        assert result["text"] == "done"
+        assert result["needs_human_input"] is True
+        assert len(result["pending_questions"]) == 1
+        assert "question_list/permission_list" in result["next_action"]
+
+    @pytest.mark.asyncio
+    async def test_answer_question_updates_queue_state(self, session_manager, mock_opencode_client):
+        """Test answering question returns remaining queue information."""
+        mock_opencode_client.reply_question = AsyncMock(return_value={
+            "success": True,
+            "answered": True,
+            "request_id": "q1",
+        })
+        mock_opencode_client.list_questions = AsyncMock(return_value=[])
+        mock_opencode_client.list_permissions = AsyncMock(return_value=[])
+
+        result = await session_manager.answer_question("q1", [["Yes"]])
+
+        assert result["success"] is True
+        assert result["remaining_questions"] == 0
+        assert result["needs_human_input"] is False
+
 
 class TestSessionModes:
     """Test session mode functionality."""

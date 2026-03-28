@@ -22,7 +22,7 @@ Exposes OpenCode as a remote MCP server for Claude Code via `mcp.homunculi.cloud
 ## Features
 
 - **OAuth 2.0 Authorization Server** - Works with Claude Code and ChatGPT Plus
-- **16 MCP Tools** - Session management, messaging, PTY terminals
+- **Expanded Bash Surface** - Raw command execution + PTY lifecycle tools
 - **Model Switching** - Support for multiple AI models per session
 - **Protected Resource Metadata** - RFC 9728 compliance
 
@@ -47,12 +47,27 @@ Exposes OpenCode as a remote MCP server for Claude Code via `mcp.homunculi.cloud
 | `message_send` | Send prompt to OpenCode agent |
 | `message_abort` | Abort ongoing generation |
 
+### Human Input Queue
+| Tool | Description |
+|------|-------------|
+| `question_list` | List pending interactive questions |
+| `question_reply` | Answer a queued question request |
+| `question_reject` | Reject a queued question request |
+| `permission_list` | List pending permission requests |
+| `permission_reply` | Respond to queued permission request (`once`, `always`, `reject`) |
+
 ### Bash (Claude's Direct Terminal)
 | Tool | Description |
 |------|-------------|
+| `bash` | Execute raw shell command (`command`, `timeout`, `workdir`, `description`) |
+| `bash_exec` | Alias of `bash` |
 | `bash_create` | Create PTY terminal |
+| `bash_list` | List PTY sessions |
+| `bash_get` | Get PTY details |
 | `bash_read` | Read PTY output |
 | `bash_resize` | Resize terminal |
+| `bash_update` | Update PTY title/size |
+| `bash_write` | Write input to PTY |
 | `bash_close` | Close PTY |
 
 ### Status
@@ -77,6 +92,11 @@ python main.py
 | `OPENCODE_HOST` | localhost | OpenCode API host |
 | `OPENCODE_PORT` | 9999 | OpenCode API port |
 | `GATEWAY_PORT` | 3001 | Gateway HTTP port |
+| `ENABLE_RAW_BASH` | true | Enables direct `bash`/`bash_exec` command tool |
+
+## Security Note
+
+`bash`/`bash_exec` is remote code execution on the host machine. Keep this gateway personal-use and protect it with strong credentials.
 
 ## OAuth Endpoints
 

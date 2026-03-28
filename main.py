@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import base64
 from pathlib import Path
+from typing import Optional, cast
 
 from dotenv import load_dotenv
 import structlog
@@ -40,12 +41,13 @@ AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", secrets.token_hex(32))
 OPENCODE_HOST = os.environ.get("OPENCODE_HOST", "localhost")
 OPENCODE_PORT = int(os.environ.get("OPENCODE_PORT", "9999"))
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "3001"))
+ENABLE_RAW_BASH = os.environ.get("ENABLE_RAW_BASH", "true").lower() != "false"
 
 SERVER_NAME = "opencode-mcp-gateway"
 
-oc_client: OpenCodeClient = None
-session_mgr: SessionManager = None
-pty_mgr: PtyManager = None
+oc_client = cast(OpenCodeClient, None)
+session_mgr = cast(SessionManager, None)
+pty_mgr = cast(PtyManager, None)
 
 auth_codes = {}
 
@@ -60,7 +62,7 @@ def create_fastmcp() -> FastMCP:
     )
 
     @mcp.tool()
-    async def list_sessions(cursor: str = None, limit: int = 10) -> dict:
+    async def list_sessions(cursor: Optional[str] = None, limit: int = 10) -> dict:
         """List OpenCode sessions with pagination.
 
         Returns all known sessions (up to limit) with recent message previews.
@@ -76,8 +78,8 @@ def create_fastmcp() -> FastMCP:
     @mcp.tool()
     async def session_create(
         initial_message: str,
-        title: str = None,
-        directory: str = None,
+        title: Optional[str] = None,
+        directory: Optional[str] = None,
         mode: str = "planning",
         auto_accept: bool = False
     ) -> dict:
@@ -140,9 +142,41 @@ def create_fastmcp() -> FastMCP:
         return await session_mgr.abort_message(session_id)
 
     @mcp.tool()
-    async def bash_create(cwd: str = None) -> dict:
-        """Create a PTY terminal."""
-        return await pty_mgr.create_pty(cwd=cwd, owner="claude")
+    async def bash_create(
+        cwd: Optional[str] = None,
+        command: Optional[str] = None,
+        args: Optional[list[str]] = None,
+        title: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+    ) -> dict:
+        """Create a PTY terminal.
+
+        Args:
+            cwd: Working directory for the terminal
+            command: Optional executable (default /bin/bash)
+            args: Optional command arguments
+            title: Optional terminal title
+            env: Optional environment variable overrides
+        """
+        return await pty_mgr.create_pty(
+            cwd=cwd,
+            owner="claude",
+            command=command,
+            args=args,
+            title=title,
+            env=env,
+        )
+
+    @mcp.tool()
+    async def bash_list() -> dict:
+        """List all PTY sessions known by OpenCode."""
+        ptys = await pty_mgr.list_remote_ptys()
+        return {"ptys": ptys, "count": len(ptys)}
+
+    @mcp.tool()
+    async def bash_get(pty_id: str) -> dict:
+        """Get PTY details by ID."""
+        return await pty_mgr.get_pty(pty_id)
 
     @mcp.tool()
     async def bash_read(pty_id: str) -> str:
@@ -155,9 +189,89 @@ def create_fastmcp() -> FastMCP:
         return await pty_mgr.resize_pty(pty_id, cols, rows)
 
     @mcp.tool()
+    async def bash_update(
+        pty_id: str,
+        title: Optional[str] = None,
+        cols: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> dict:
+        """Update PTY metadata and/or terminal size."""
+        return await pty_mgr.update_pty(pty_id=pty_id, title=title, cols=cols, rows=rows)
+
+    @mcp.tool()
+    async def bash_write(pty_id: str, data: str) -> dict:
+        """Write raw input bytes/text to a PTY."""
+        return await pty_mgr.send_input(pty_id, data)
+
+    @mcp.tool()
     async def bash_close(pty_id: str) -> dict:
         """Close PTY."""
         return await pty_mgr.close_pty(pty_id)
+
+    async def _run_raw_bash(
+        command: str,
+        timeout: int = 120,
+        workdir: Optional[str] = None,
+        description: str = "",
+        session_id: Optional[str] = None,
+    ) -> dict:
+        if not ENABLE_RAW_BASH:
+            return {
+                "success": False,
+                "error": "Raw bash execution is disabled. Set ENABLE_RAW_BASH=true to enable.",
+            }
+
+        return await session_mgr.run_shell_command(
+            command=command,
+            session_id=session_id,
+            workdir=workdir,
+            timeout_seconds=timeout,
+            description=description,
+        )
+
+    @mcp.tool()
+    async def bash(
+        command: str,
+        timeout: int = 120,
+        workdir: Optional[str] = None,
+        description: str = "",
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """Execute a raw shell command directly.
+
+        This mirrors OpenCode's bash tool semantics for direct command execution.
+
+        Args:
+            command: Shell command to execute
+            timeout: Max seconds to allow the command to run
+            workdir: Optional working directory
+            description: Optional operator note for traceability
+            session_id: Optional explicit session ID
+        """
+        return await _run_raw_bash(
+            command=command,
+            timeout=timeout,
+            workdir=workdir,
+            description=description,
+            session_id=session_id,
+        )
+
+    @mcp.tool()
+    async def bash_exec(
+        command: str,
+        timeout: int = 120,
+        workdir: Optional[str] = None,
+        description: str = "",
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """Alias of bash() for direct command execution."""
+        return await _run_raw_bash(
+            command=command,
+            timeout=timeout,
+            workdir=workdir,
+            description=description,
+            session_id=session_id,
+        )
 
     @mcp.tool()
     def status() -> dict:
@@ -169,6 +283,7 @@ def create_fastmcp() -> FastMCP:
             "total_sessions": len(sessions),
             "claude_sessions": len(session_mgr.get_claude_session_ids()),
             "claude_ptys": ptys,
+            "raw_bash_enabled": ENABLE_RAW_BASH,
         }
 
     @mcp.tool()
@@ -242,6 +357,61 @@ def create_fastmcp() -> FastMCP:
         """
         permissions = [{"permission": "*", "pattern": "*", "action": "allow"}]
         return await session_mgr.set_session_permissions(session_id, permissions)
+
+    @mcp.tool()
+    async def question_list(session_id: Optional[str] = None) -> dict:
+        """List pending interactive questions from OpenCode.
+
+        Args:
+            session_id: Optional filter to only show questions for one session.
+        """
+        return await session_mgr.list_pending_questions(session_id=session_id)
+
+    @mcp.tool()
+    async def question_reply(request_id: str, answers: list[list[str]]) -> dict:
+        """Reply to a pending interactive question.
+
+        Args:
+            request_id: Question request ID from question_list
+            answers: Answers for each question in order (each answer is list of selected labels)
+        """
+        return await session_mgr.answer_question(request_id=request_id, answers=answers)
+
+    @mcp.tool()
+    async def question_reject(request_id: str) -> dict:
+        """Reject a pending interactive question request."""
+        return await session_mgr.reject_question(request_id=request_id)
+
+    @mcp.tool()
+    async def permission_list(session_id: Optional[str] = None) -> dict:
+        """List pending permission requests from OpenCode."""
+        return await session_mgr.list_pending_permissions(session_id=session_id)
+
+    @mcp.tool()
+    async def permission_reply(
+        request_id: str,
+        reply: str,
+        message: str = "",
+    ) -> dict:
+        """Reply to a pending permission request.
+
+        Args:
+            request_id: Permission request ID from permission_list
+            reply: one of 'once', 'always', or 'reject'
+            message: Optional explanation/feedback string
+        """
+        if reply not in ("once", "always", "reject"):
+            return {
+                "success": False,
+                "error": "reply must be one of: once, always, reject",
+                "request_id": request_id,
+            }
+
+        return await session_mgr.reply_permission(
+            request_id=request_id,
+            reply=reply,
+            message=message,
+        )
 
     @mcp.tool()
     async def wait_for_session(session_id: str, duration: int = 50) -> dict:

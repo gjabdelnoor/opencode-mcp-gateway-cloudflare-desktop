@@ -218,6 +218,196 @@ class TestOpenCodeClient:
         assert call_args[1]["json"]["cwd"] == "/tmp"
 
     @pytest.mark.asyncio
+    async def test_create_pty_with_command_args(self, client):
+        """Test creating a PTY with explicit command details."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value={"id": "pty-1"})
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        await client.create_pty(
+            cwd="/tmp",
+            command="/bin/bash",
+            args=["-lc", "echo hi"],
+            title="Runner",
+            env={"FOO": "bar"},
+        )
+
+        call_args = client.client.post.call_args
+        assert call_args[1]["json"]["command"] == "/bin/bash"
+        assert call_args[1]["json"]["args"] == ["-lc", "echo hi"]
+        assert call_args[1]["json"]["title"] == "Runner"
+        assert call_args[1]["json"]["env"] == {"FOO": "bar"}
+
+    @pytest.mark.asyncio
+    async def test_list_ptys(self, client):
+        """Test listing PTY sessions."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value=[{"id": "pty-1"}])
+        client.client.get = AsyncMock(return_value=mock_response)
+
+        result = await client.list_ptys()
+
+        assert result == [{"id": "pty-1"}]
+        client.client.get.assert_called_once_with("/pty", params={})
+
+    @pytest.mark.asyncio
+    async def test_get_pty(self, client):
+        """Test getting PTY metadata by ID."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value={"id": "pty-1", "status": "running"})
+        client.client.get = AsyncMock(return_value=mock_response)
+
+        result = await client.get_pty("pty-1")
+
+        assert result["id"] == "pty-1"
+        client.client.get.assert_called_once_with("/pty/pty-1", params={})
+
+    @pytest.mark.asyncio
+    async def test_update_pty(self, client):
+        """Test updating PTY title and size."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value={"id": "pty-1", "status": "running"})
+        client.client.put = AsyncMock(return_value=mock_response)
+
+        result = await client.update_pty("pty-1", title="New", rows=30, cols=120)
+
+        assert result["id"] == "pty-1"
+        client.client.put.assert_called_once()
+        call_args = client.client.put.call_args
+        assert call_args[0][0] == "/pty/pty-1"
+        assert call_args[1]["json"] == {"title": "New", "size": {"rows": 30, "cols": 120}}
+
+    @pytest.mark.asyncio
+    async def test_update_pty_requires_both_rows_and_cols(self, client):
+        """Test update_pty validates rows/cols pair."""
+        with pytest.raises(ValueError):
+            await client.update_pty("pty-1", rows=24)
+
+    @pytest.mark.asyncio
+    async def test_write_pty(self, client):
+        """Test writing input to PTY endpoint."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.write_pty("pty-1", "ls\n")
+
+        assert result == {"success": True, "result": True, "pty_id": "pty-1"}
+        client.client.post.assert_called_once_with(
+            "/pty/pty-1",
+            params={},
+            json={"input": "ls\n"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_shell(self, client):
+        """Test running shell command via session shell endpoint."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = '{"info": {"id": "msg-1"}, "parts": []}'
+        mock_response.json = MagicMock(return_value={"info": {"id": "msg-1"}, "parts": []})
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.run_shell("s1", "echo hi", model="openai/gpt-4o", agent="build")
+
+        assert result["info"]["id"] == "msg-1"
+        call_args = client.client.post.call_args
+        assert call_args[0][0] == "/session/s1/shell"
+        assert call_args[1]["json"]["command"] == "echo hi"
+        assert call_args[1]["json"]["agent"] == "build"
+        assert call_args[1]["json"]["model"] == {"providerID": "openai", "modelID": "gpt-4o"}
+
+    @pytest.mark.asyncio
+    async def test_list_questions(self, client):
+        """Test listing pending questions."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value=[{"id": "q1"}])
+        client.client.get = AsyncMock(return_value=mock_response)
+
+        result = await client.list_questions()
+
+        assert result == [{"id": "q1"}]
+        client.client.get.assert_called_once_with("/question", params={})
+
+    @pytest.mark.asyncio
+    async def test_reply_question(self, client):
+        """Test replying to pending question."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.reply_question("q1", [["Yes"]])
+
+        assert result["answered"] is True
+        assert result["request_id"] == "q1"
+        assert result["answers"] == [["Yes"]]
+        client.client.post.assert_called_once_with(
+            "/question/q1/reply",
+            params={},
+            json={"answers": [["Yes"]]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_reject_question(self, client):
+        """Test rejecting pending question."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.reject_question("q1")
+
+        assert result["rejected"] is True
+        assert result["request_id"] == "q1"
+        client.client.post.assert_called_once_with(
+            "/question/q1/reject",
+            params={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_permissions(self, client):
+        """Test listing pending permission requests."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value=[{"id": "p1"}])
+        client.client.get = AsyncMock(return_value=mock_response)
+
+        result = await client.list_permissions()
+
+        assert result == [{"id": "p1"}]
+        client.client.get.assert_called_once_with("/permission", params={})
+
+    @pytest.mark.asyncio
+    async def test_reply_permission(self, client):
+        """Test replying to pending permission request."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.reply_permission("p1", "always", message="trusted")
+
+        assert result["replied"] is True
+        assert result["request_id"] == "p1"
+        assert result["reply"] == "always"
+        client.client.post.assert_called_once_with(
+            "/permission/p1/reply",
+            params={},
+            json={"reply": "always", "message": "trusted"},
+        )
+
+    @pytest.mark.asyncio
     async def test_resize_pty(self, client):
         """Test resizing a PTY."""
         mock_response = MagicMock()

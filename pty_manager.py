@@ -26,10 +26,24 @@ class PtyManager:
         self.ptys: dict[str, PtyInfo] = {}
         self._lock = asyncio.Lock()
 
-    async def create_pty(self, cwd: Optional[str] = None, owner: str = "claude") -> dict:
+    async def create_pty(
+        self,
+        cwd: Optional[str] = None,
+        owner: str = "claude",
+        command: Optional[str] = None,
+        args: Optional[list[str]] = None,
+        title: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+    ) -> dict:
         """Create a new PTY for Claude."""
         async with self._lock:
-            result = await self.oc.create_pty(cwd=cwd)
+            result = await self.oc.create_pty(
+                cwd=cwd,
+                command=command,
+                args=args,
+                title=title,
+                env=env,
+            )
             pty_id = result.get("id")
             if pty_id:
                 info = PtyInfo(pty_id=pty_id, owner=owner, cwd=cwd)
@@ -48,15 +62,51 @@ class PtyManager:
     async def read_output(self, pty_id: str) -> str:
         """Read current PTY output buffer."""
         async with self._lock:
-            if pty_id not in self.ptys:
-                return ""
             try:
                 result = await self.oc.get_pty_output(pty_id)
-                self.ptys[pty_id].touch()
+                if pty_id in self.ptys:
+                    self.ptys[pty_id].touch()
                 return result.get("data", "")
             except Exception as e:
                 logger.error("pty_read_error", pty_id=pty_id, error=str(e))
                 return ""
+
+    async def get_pty(self, pty_id: str) -> dict:
+        """Get details for a specific PTY."""
+        async with self._lock:
+            result = await self.oc.get_pty(pty_id)
+            if pty_id in self.ptys:
+                self.ptys[pty_id].touch()
+            return result
+
+    async def list_remote_ptys(self) -> list[dict]:
+        """List all PTYs currently known by OpenCode."""
+        async with self._lock:
+            remote = await self.oc.list_ptys()
+            for pty in remote:
+                pty_id = pty.get("id")
+                if pty_id in self.ptys:
+                    pty["owner"] = self.ptys[pty_id].owner
+            return remote
+
+    async def update_pty(
+        self,
+        pty_id: str,
+        title: Optional[str] = None,
+        cols: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> dict:
+        """Update PTY metadata like title and terminal size."""
+        async with self._lock:
+            result = await self.oc.update_pty(
+                pty_id=pty_id,
+                title=title,
+                rows=rows,
+                cols=cols,
+            )
+            if pty_id in self.ptys:
+                self.ptys[pty_id].touch()
+            return result
 
     async def send_input(self, pty_id: str, data: str) -> dict:
         """Send input to PTY. Note: OpenCode may not support direct input via REST."""
@@ -64,10 +114,7 @@ class PtyManager:
             if pty_id not in self.ptys:
                 return {"error": "PTY not found"}
             self.ptys[pty_id].touch()
-            return await self.oc.client.post(
-                f"/pty/{pty_id}",
-                json={"input": data}
-            )
+            return await self.oc.write_pty(pty_id=pty_id, data=data)
 
     async def close_pty(self, pty_id: str) -> dict:
         """Close a PTY session."""

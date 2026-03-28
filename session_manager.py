@@ -1,5 +1,6 @@
 import asyncio
 import time
+import shlex
 import httpx
 from typing import Optional, Literal
 from datetime import datetime
@@ -134,6 +135,164 @@ class SessionManager:
         mode = self.session_modes.get(session_id, "planning")
         return "plan" if mode == "planning" else "build"
 
+    async def ensure_session(self, session_id: Optional[str] = None) -> str:
+        """Resolve a session ID for operations that can run without explicit session input."""
+        if session_id:
+            return session_id
+
+        if self.active_session_id:
+            return self.active_session_id
+
+        async with self._lock:
+            created = await self.oc.create_session(title="Raw Bash Session")
+            new_id = created.get("id")
+            if not new_id:
+                raise RuntimeError("Failed to create fallback session for bash execution")
+
+            info = SessionInfo(
+                session_id=new_id,
+                title="Raw Bash Session",
+                owner="claude",
+                created_at=datetime.now(),
+            )
+            self.sessions[new_id] = info
+            self.claude_session_ids.add(new_id)
+            self.session_modes[new_id] = "building"
+            self.active_session_id = new_id
+            logger.info("created_shell_session", session_id=new_id)
+            return new_id
+
+    @staticmethod
+    def _build_shell_command(command: str, workdir: Optional[str], timeout_seconds: int) -> str:
+        inner = command
+        if workdir:
+            inner = f"cd {shlex.quote(workdir)} && {inner}"
+
+        wrapped = f"bash -lc {shlex.quote(inner)}"
+        if timeout_seconds > 0:
+            wrapped = f"timeout {int(timeout_seconds)}s {wrapped}"
+
+        return wrapped
+
+    @staticmethod
+    def _format_question_request(request: dict) -> dict:
+        questions = []
+        for item in request.get("questions", []):
+            questions.append({
+                "header": item.get("header", ""),
+                "question": item.get("question", ""),
+                "multiple": bool(item.get("multiple", False)),
+                "custom": item.get("custom", True),
+                "options": item.get("options", []),
+            })
+
+        return {
+            "request_id": request.get("id"),
+            "session_id": request.get("sessionID"),
+            "tool": request.get("tool"),
+            "questions": questions,
+        }
+
+    @staticmethod
+    def _format_permission_request(request: dict) -> dict:
+        return {
+            "request_id": request.get("id"),
+            "session_id": request.get("sessionID"),
+            "permission": request.get("permission"),
+            "patterns": request.get("patterns", []),
+            "metadata": request.get("metadata", {}),
+            "always": request.get("always", []),
+            "tool": request.get("tool"),
+        }
+
+    async def _collect_pending_inputs(self, session_id: Optional[str]) -> dict:
+        pending_questions: list[dict] = []
+        pending_permissions: list[dict] = []
+        errors: list[str] = []
+
+        try:
+            questions = await self.oc.list_questions()
+            if session_id:
+                questions = [q for q in questions if q.get("sessionID") == session_id]
+            pending_questions = [self._format_question_request(q) for q in questions]
+        except Exception as e:
+            errors.append(f"question_list_failed: {e}")
+
+        try:
+            permissions = await self.oc.list_permissions()
+            if session_id:
+                permissions = [p for p in permissions if p.get("sessionID") == session_id]
+            pending_permissions = [self._format_permission_request(p) for p in permissions]
+        except Exception as e:
+            errors.append(f"permission_list_failed: {e}")
+
+        return {
+            "pending_questions": pending_questions,
+            "pending_permissions": pending_permissions,
+            "needs_human_input": bool(pending_questions or pending_permissions),
+            "pending_input_errors": errors,
+        }
+
+    async def _attach_pending_inputs(self, result: dict, session_id: Optional[str]) -> dict:
+        pending = await self._collect_pending_inputs(session_id)
+        result.update(pending)
+        if result.get("needs_human_input") and "next_action" not in result:
+            result["next_action"] = (
+                "Pending interactive request detected. "
+                "Call question_list/permission_list, then answer via question_reply or permission_reply."
+            )
+        return result
+
+    async def list_pending_questions(self, session_id: Optional[str] = None) -> dict:
+        pending = await self._collect_pending_inputs(session_id)
+        return {
+            "session_id": session_id,
+            "questions": pending["pending_questions"],
+            "count": len(pending["pending_questions"]),
+            "needs_human_input": bool(pending["pending_questions"]),
+            "errors": [e for e in pending["pending_input_errors"] if e.startswith("question_list_failed")],
+        }
+
+    async def answer_question(self, request_id: str, answers: list[list[str]]) -> dict:
+        result = await self.oc.reply_question(request_id=request_id, answers=answers)
+        pending = await self._collect_pending_inputs(None)
+        result["remaining_questions"] = len(pending["pending_questions"])
+        result["needs_human_input"] = bool(pending["pending_questions"] or pending["pending_permissions"])
+        return result
+
+    async def reject_question(self, request_id: str) -> dict:
+        result = await self.oc.reject_question(request_id=request_id)
+        pending = await self._collect_pending_inputs(None)
+        result["remaining_questions"] = len(pending["pending_questions"])
+        result["needs_human_input"] = bool(pending["pending_questions"] or pending["pending_permissions"])
+        return result
+
+    async def list_pending_permissions(self, session_id: Optional[str] = None) -> dict:
+        pending = await self._collect_pending_inputs(session_id)
+        return {
+            "session_id": session_id,
+            "permissions": pending["pending_permissions"],
+            "count": len(pending["pending_permissions"]),
+            "needs_human_input": bool(pending["pending_permissions"]),
+            "errors": [e for e in pending["pending_input_errors"] if e.startswith("permission_list_failed")],
+        }
+
+    async def reply_permission(
+        self,
+        request_id: str,
+        reply: Literal["once", "always", "reject"],
+        message: str = "",
+    ) -> dict:
+        result = await self.oc.reply_permission(
+            request_id=request_id,
+            reply=reply,
+            message=message or None,
+        )
+        pending = await self._collect_pending_inputs(None)
+        result["remaining_permissions"] = len(pending["pending_permissions"])
+        result["needs_human_input"] = bool(pending["pending_questions"] or pending["pending_permissions"])
+        return result
+
     def _extract_message_activity(self, message: dict) -> dict:
         parts = message.get("parts", [])
         text_chunks = []
@@ -210,7 +369,7 @@ class SessionManager:
 
             if response and response.get("parts"):
                 extracted = self._extract_message_activity(response)
-                return {
+                return await self._attach_pending_inputs({
                     "text": extracted["text"],
                     "tool_calls": extracted["tool_calls"],
                     "reasoning": extracted["reasoning"],
@@ -218,13 +377,13 @@ class SessionManager:
                     "elapsed_seconds": elapsed,
                     "agent": agent,
                     "mode": self.session_modes.get(session_id, "planning"),
-                }
+                }, session_id)
 
             # Empty response can happen when the message is accepted but still processing.
             latest = await self._latest_assistant_snapshot(session_id)
             if latest:
                 extracted = self._extract_message_activity(latest)
-                return {
+                return await self._attach_pending_inputs({
                     "partial_result": {
                         "text": extracted["text"][:1000],
                         "tool_calls": extracted["tool_calls"][:5],
@@ -235,9 +394,9 @@ class SessionManager:
                     "elapsed_seconds": elapsed,
                     "agent": agent,
                     "mode": self.session_modes.get(session_id, "planning"),
-                }
+                }, session_id)
 
-            return {
+            return await self._attach_pending_inputs({
                 "partial_result": {
                     "text": "",
                     "tool_calls": [],
@@ -248,14 +407,14 @@ class SessionManager:
                 "elapsed_seconds": elapsed,
                 "agent": agent,
                 "mode": self.session_modes.get(session_id, "planning"),
-            }
+            }, session_id)
 
         except httpx.TimeoutException:
             elapsed = int(time.time() - start_time)
             latest = await self._latest_assistant_snapshot(session_id)
             if latest:
                 extracted = self._extract_message_activity(latest)
-                return {
+                return await self._attach_pending_inputs({
                     "partial_result": {
                         "text": extracted["text"][:1000],
                         "tool_calls": extracted["tool_calls"][:5],
@@ -266,9 +425,9 @@ class SessionManager:
                     "elapsed_seconds": elapsed,
                     "agent": agent,
                     "mode": self.session_modes.get(session_id, "planning"),
-                }
+                }, session_id)
 
-            return {
+            return await self._attach_pending_inputs({
                 "partial_result": {
                     "text": "",
                     "tool_calls": [],
@@ -279,21 +438,137 @@ class SessionManager:
                 "elapsed_seconds": elapsed,
                 "agent": agent,
                 "mode": self.session_modes.get(session_id, "planning"),
-            }
+            }, session_id)
 
         except Exception as e:
             logger.error("send_message_error", session_id=session_id, error=str(e))
             elapsed = int(time.time() - start_time)
-            return {
+            return await self._attach_pending_inputs({
                 "error": str(e),
                 "elapsed_seconds": elapsed,
                 "agent": agent,
                 "mode": self.session_modes.get(session_id, "planning"),
-            }
+            }, session_id)
 
     async def send_message(self, session_id: str, prompt: str, model: Optional[str] = None) -> dict:
         """Send a message to a session with timeout handling."""
         return await self._send_message_with_timeout(session_id, prompt, model=model)
+
+    async def run_shell_command(
+        self,
+        command: str,
+        session_id: Optional[str] = None,
+        workdir: Optional[str] = None,
+        timeout_seconds: int = 120,
+        description: str = "",
+    ) -> dict:
+        """Run a raw shell command via OpenCode's shell endpoint."""
+        timeout_seconds = max(1, int(timeout_seconds))
+        start_time = time.time()
+
+        resolved_session_id = await self.ensure_session(session_id=session_id)
+        model = self.session_models.get(resolved_session_id)
+        agent = self._agent_for_session_mode(resolved_session_id)
+        wrapped_command = self._build_shell_command(
+            command=command,
+            workdir=workdir,
+            timeout_seconds=timeout_seconds,
+        )
+        request_timeout = max(timeout_seconds + 15, TOOL_TIMEOUT)
+
+        try:
+            response = await self.oc.run_shell(
+                session_id=resolved_session_id,
+                command=wrapped_command,
+                model=model,
+                agent=agent,
+                timeout=request_timeout,
+            )
+            elapsed = int(time.time() - start_time)
+
+            info = response.get("info", {}) if isinstance(response, dict) else {}
+            parts = response.get("parts", []) if isinstance(response, dict) else []
+
+            outputs: list[str] = []
+            tool_calls = []
+            tool_status = "unknown"
+
+            for part in parts:
+                part_type = part.get("type", "")
+                if part_type == "text":
+                    text = part.get("text", "")
+                    if text:
+                        outputs.append(text)
+
+                if part_type != "tool":
+                    continue
+
+                state = part.get("state", {})
+                metadata = state.get("metadata", {})
+                output = state.get("output") or metadata.get("output")
+                if output:
+                    outputs.append(str(output))
+
+                if part.get("tool") == "bash":
+                    tool_status = state.get("status", tool_status)
+
+                tool_calls.append({
+                    "tool": part.get("tool", "unknown"),
+                    "state": state,
+                })
+
+            cleaned_output: list[str] = []
+            for chunk in outputs:
+                if chunk and chunk not in cleaned_output:
+                    cleaned_output.append(chunk)
+
+            return await self._attach_pending_inputs({
+                "session_id": resolved_session_id,
+                "message_id": info.get("id"),
+                "command": command,
+                "executed_command": wrapped_command,
+                "description": description,
+                "workdir": workdir,
+                "timeout_seconds": timeout_seconds,
+                "output": "\n".join(cleaned_output).strip(),
+                "tool_calls": tool_calls,
+                "tool_status": tool_status,
+                "completed": bool(info.get("time", {}).get("completed")),
+                "elapsed_seconds": elapsed,
+                "agent": agent,
+                "mode": self.session_modes.get(resolved_session_id, "planning"),
+            }, resolved_session_id)
+
+        except httpx.TimeoutException:
+            elapsed = int(time.time() - start_time)
+            return await self._attach_pending_inputs({
+                "session_id": resolved_session_id,
+                "command": command,
+                "executed_command": wrapped_command,
+                "description": description,
+                "workdir": workdir,
+                "timeout_seconds": timeout_seconds,
+                "elapsed_seconds": elapsed,
+                "still_active": True,
+                "message": "Command is still running or delayed. Use read_session_logs for more detail.",
+                "agent": agent,
+                "mode": self.session_modes.get(resolved_session_id, "planning"),
+            }, resolved_session_id)
+        except Exception as e:
+            elapsed = int(time.time() - start_time)
+            logger.error("run_shell_command_error", session_id=resolved_session_id, error=str(e))
+            return await self._attach_pending_inputs({
+                "session_id": resolved_session_id,
+                "command": command,
+                "executed_command": wrapped_command,
+                "description": description,
+                "workdir": workdir,
+                "timeout_seconds": timeout_seconds,
+                "elapsed_seconds": elapsed,
+                "error": str(e),
+                "agent": agent,
+                "mode": self.session_modes.get(resolved_session_id, "planning"),
+            }, resolved_session_id)
 
     async def send_message_stream(self, session_id: str, prompt: str, stream: bool = True, model: Optional[str] = None):
         """Send a message to a session (legacy stream support)."""

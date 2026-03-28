@@ -14,7 +14,13 @@ class TestPtyManager:
         result = await pty_manager.create_pty(cwd="/tmp", owner="claude")
         
         assert result["id"] == "pty-1"
-        mock_opencode_client.create_pty.assert_called_once_with(cwd="/tmp")
+        mock_opencode_client.create_pty.assert_called_once_with(
+            cwd="/tmp",
+            command=None,
+            args=None,
+            title=None,
+            env=None,
+        )
         assert "pty-1" in pty_manager.ptys
         assert pty_manager.ptys["pty-1"].owner == "claude"
 
@@ -35,6 +41,52 @@ class TestPtyManager:
         
         assert result["success"] is True
         mock_opencode_client.resize_pty.assert_called_once_with("pty-1", 120, 40)
+
+    @pytest.mark.asyncio
+    async def test_get_pty(self, pty_manager, mock_opencode_client):
+        """Test getting PTY details."""
+        await pty_manager.create_pty(owner="claude")
+
+        result = await pty_manager.get_pty("pty-1")
+
+        assert result["id"] == "pty-1"
+        mock_opencode_client.get_pty.assert_called_once_with("pty-1")
+
+    @pytest.mark.asyncio
+    async def test_list_remote_ptys(self, pty_manager, mock_opencode_client):
+        """Test listing PTYs from OpenCode."""
+        await pty_manager.create_pty(owner="claude")
+
+        result = await pty_manager.list_remote_ptys()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "pty-1"
+        mock_opencode_client.list_ptys.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_update_pty(self, pty_manager, mock_opencode_client):
+        """Test updating PTY metadata."""
+        await pty_manager.create_pty(owner="claude")
+
+        result = await pty_manager.update_pty("pty-1", title="Renamed", cols=100, rows=30)
+
+        assert result["id"] == "pty-1"
+        mock_opencode_client.update_pty.assert_called_once_with(
+            pty_id="pty-1",
+            title="Renamed",
+            rows=30,
+            cols=100,
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_input(self, pty_manager, mock_opencode_client):
+        """Test writing input to PTY."""
+        await pty_manager.create_pty(owner="claude")
+
+        result = await pty_manager.send_input("pty-1", "ls\n")
+
+        assert result["success"] is True
+        mock_opencode_client.write_pty.assert_called_once_with(pty_id="pty-1", data="ls\n")
 
     @pytest.mark.asyncio
     async def test_read_output(self, pty_manager, mock_opencode_client):

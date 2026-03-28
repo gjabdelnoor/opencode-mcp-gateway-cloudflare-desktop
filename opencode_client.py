@@ -197,12 +197,130 @@ class OpenCodeClient:
             yield {"type": "part", "part": part}
         yield {"type": "done", "message": message}
 
+    async def run_shell(
+        self,
+        session_id: str,
+        command: str,
+        model: Optional[str] = None,
+        agent: str = "build",
+        directory: Optional[str] = None,
+        timeout: float = TIMEOUT,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "command": command,
+        }
+
+        model_payload = self._build_model_payload(model)
+        if model_payload:
+            payload["model"] = model_payload
+
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+
+        resp = await self.client.post(
+            f"/session/{session_id}/shell",
+            params=params,
+            json=payload,
+            timeout=httpx.Timeout(timeout, connect=10.0),
+        )
+        resp.raise_for_status()
+        result = self._parse_response_body(resp)
+        if isinstance(result, dict):
+            return result
+        return {"success": bool(result), "result": result}
+
     async def list_messages(self, session_id: str, limit: int = 50, directory: Optional[str] = None) -> list[dict]:
         params: dict[str, Any] = {"limit": limit, **({"directory": directory} if directory else {})}
         resp = await self.client.get(f"/session/{session_id}/message", params=params)
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else []
+
+    async def list_permissions(self, directory: Optional[str] = None) -> list[dict]:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.get("/permission", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def reply_permission(
+        self,
+        request_id: str,
+        reply: str,
+        message: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        payload: dict[str, Any] = {"reply": reply}
+        if message:
+            payload["message"] = message
+
+        resp = await self.client.post(
+            f"/permission/{request_id}/reply",
+            params=params,
+            json=payload,
+        )
+        resp.raise_for_status()
+        result = self._parse_response_body(resp)
+        if result is None:
+            result = True
+        coerced = self._coerce_action_result(
+            result,
+            flag_key="replied",
+            id_key="request_id",
+            id_value=request_id,
+        )
+        coerced["reply"] = reply
+        return coerced
+
+    async def list_questions(self, directory: Optional[str] = None) -> list[dict]:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.get("/question", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def reply_question(
+        self,
+        request_id: str,
+        answers: list[list[str]],
+        directory: Optional[str] = None,
+    ) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.post(
+            f"/question/{request_id}/reply",
+            params=params,
+            json={"answers": answers},
+        )
+        resp.raise_for_status()
+        result = self._parse_response_body(resp)
+        if result is None:
+            result = True
+        coerced = self._coerce_action_result(
+            result,
+            flag_key="answered",
+            id_key="request_id",
+            id_value=request_id,
+        )
+        coerced["answers"] = answers
+        return coerced
+
+    async def reject_question(self, request_id: str, directory: Optional[str] = None) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.post(
+            f"/question/{request_id}/reject",
+            params=params,
+        )
+        resp.raise_for_status()
+        result = self._parse_response_body(resp)
+        if result is None:
+            result = True
+        return self._coerce_action_result(
+            result,
+            flag_key="rejected",
+            id_key="request_id",
+            id_value=request_id,
+        )
 
     async def get_message(self, session_id: str, message_id: str, directory: Optional[str] = None) -> dict:
         params: dict[str, Any] = {"directory": directory} if directory else {}
@@ -228,13 +346,80 @@ class OpenCodeClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def create_pty(self, cwd: Optional[str] = None) -> dict:
-        payload = {}
+    async def create_pty(
+        self,
+        cwd: Optional[str] = None,
+        command: Optional[str] = None,
+        args: Optional[list[str]] = None,
+        title: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+    ) -> dict:
+        payload: dict[str, Any] = {}
         if cwd:
             payload["cwd"] = cwd
+        if command:
+            payload["command"] = command
+        if args is not None:
+            payload["args"] = args
+        if title:
+            payload["title"] = title
+        if env:
+            payload["env"] = env
         resp = await self.client.post("/pty", json=payload)
         resp.raise_for_status()
         return resp.json()
+
+    async def list_ptys(self, directory: Optional[str] = None) -> list[dict]:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.get("/pty", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def get_pty(self, pty_id: str, directory: Optional[str] = None) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.get(f"/pty/{pty_id}", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_pty(
+        self,
+        pty_id: str,
+        title: Optional[str] = None,
+        rows: Optional[int] = None,
+        cols: Optional[int] = None,
+        directory: Optional[str] = None,
+    ) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        payload: dict[str, Any] = {}
+
+        if title is not None:
+            payload["title"] = title
+
+        if rows is not None or cols is not None:
+            if rows is None or cols is None:
+                raise ValueError("rows and cols must both be set when updating PTY size")
+            payload["size"] = {"rows": rows, "cols": cols}
+
+        if not payload:
+            return await self.get_pty(pty_id, directory=directory)
+
+        resp = await self.client.put(f"/pty/{pty_id}", params=params, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def write_pty(self, pty_id: str, data: str, directory: Optional[str] = None) -> dict:
+        params: dict[str, Any] = {"directory": directory} if directory else {}
+        resp = await self.client.post(
+            f"/pty/{pty_id}",
+            params=params,
+            json={"input": data},
+        )
+        resp.raise_for_status()
+        result = self._parse_response_body(resp)
+        if isinstance(result, dict):
+            return result
+        return {"success": True, "result": result, "pty_id": pty_id}
 
     async def resize_pty(self, pty_id: str, cols: int, rows: int) -> dict:
         resp = await self.client.put(
