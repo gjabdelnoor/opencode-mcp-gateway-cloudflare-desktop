@@ -36,7 +36,7 @@ class TestOpenCodeClient:
         mock_response.raise_for_status = MagicMock()
         mock_response.json = MagicMock(return_value=[
             {"id": "s1", "title": "Session 1", "slug": "s1", "time": {"created": 123, "updated": 456}},
-            {"id": "s2", "title": "Session 2", "slug": "s2", "time": {"created": 789, "updated": 012}},
+            {"id": "s2", "title": "Session 2", "slug": "s2", "time": {"created": 789, "updated": 789}},
         ])
         client.client.get = AsyncMock(return_value=mock_response)
         
@@ -166,11 +166,26 @@ class TestOpenCodeClient:
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json = MagicMock(return_value={"aborted": True})
+        mock_response.text = '{"aborted": true}'
         client.client.post = AsyncMock(return_value=mock_response)
         
         result = await client.abort_message("s1")
         
         assert result["aborted"] is True
+        client.client.post.assert_called_once_with("/session/s1/abort")
+
+    @pytest.mark.asyncio
+    async def test_abort_message_wraps_bool_response(self, client):
+        """Test aborting wraps bare boolean response into a dict."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.post = AsyncMock(return_value=mock_response)
+
+        result = await client.abort_message("s1")
+
+        assert result == {"success": True, "aborted": True, "session_id": "s1"}
         client.client.post.assert_called_once_with("/session/s1/abort")
 
     @pytest.mark.asyncio
@@ -238,9 +253,24 @@ class TestOpenCodeClient:
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json = MagicMock(return_value={"success": True})
+        mock_response.text = '{"success": true}'
         client.client.delete = AsyncMock(return_value=mock_response)
         
         result = await client.close_pty("pty-1")
         
         assert result["success"] is True
+        client.client.delete.assert_called_once_with("/pty/pty-1")
+
+    @pytest.mark.asyncio
+    async def test_close_pty_wraps_bool_response(self, client):
+        """Test closing PTY wraps bare boolean response into a dict."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.text = "true"
+        mock_response.json = MagicMock(return_value=True)
+        client.client.delete = AsyncMock(return_value=mock_response)
+
+        result = await client.close_pty("pty-1")
+
+        assert result == {"success": True, "closed": True, "pty_id": "pty-1"}
         client.client.delete.assert_called_once_with("/pty/pty-1")

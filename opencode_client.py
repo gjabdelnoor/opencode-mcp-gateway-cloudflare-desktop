@@ -62,7 +62,7 @@ class OpenCodeClient:
         return resp.json()
 
     async def create_session(self, title: Optional[str] = None, directory: Optional[str] = None, permissions: Optional[list] = None) -> dict:
-        payload = {}
+        payload: dict[str, Any] = {}
         if title:
             payload["title"] = title
         if directory:
@@ -77,6 +77,37 @@ class OpenCodeClient:
         resp = await self.client.delete(f"/session/{session_id}")
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _parse_response_body(resp: httpx.Response) -> Any:
+        if not resp.text:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return resp.text
+
+    @staticmethod
+    def _coerce_action_result(
+        result: Any,
+        *,
+        flag_key: str,
+        id_key: Optional[str] = None,
+        id_value: Optional[str] = None,
+    ) -> dict:
+        if isinstance(result, dict):
+            return result
+
+        success = bool(result)
+        payload: dict[str, Any] = {"success": success, flag_key: success}
+
+        if id_key and id_value:
+            payload[id_key] = id_value
+
+        if result is not None and not isinstance(result, bool):
+            payload["result"] = result
+
+        return payload
 
     def _build_model_payload(self, model: Optional[str]) -> Optional[dict]:
         if not model:
@@ -96,7 +127,7 @@ class OpenCodeClient:
         timeout: float = TIMEOUT,
         no_reply: Optional[bool] = None,
     ) -> dict:
-        payload = {
+        payload: dict[str, Any] = {
             "parts": [{"type": "text", "text": prompt}],
             "agent": agent,
         }
@@ -129,7 +160,7 @@ class OpenCodeClient:
         model: Optional[str] = None,
         agent: str = "build",
     ) -> dict:
-        payload = {
+        payload: dict[str, Any] = {
             "parts": [{"type": "text", "text": prompt}],
             "agent": agent,
         }
@@ -167,18 +198,14 @@ class OpenCodeClient:
         yield {"type": "done", "message": message}
 
     async def list_messages(self, session_id: str, limit: int = 50, directory: Optional[str] = None) -> list[dict]:
-        params = {"limit": limit}
-        if directory:
-            params["directory"] = directory
+        params: dict[str, Any] = {"limit": limit, **({"directory": directory} if directory else {})}
         resp = await self.client.get(f"/session/{session_id}/message", params=params)
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else []
 
     async def get_message(self, session_id: str, message_id: str, directory: Optional[str] = None) -> dict:
-        params = {}
-        if directory:
-            params["directory"] = directory
+        params: dict[str, Any] = {"directory": directory} if directory else {}
         resp = await self.client.get(f"/session/{session_id}/message/{message_id}", params=params)
         resp.raise_for_status()
         return resp.json()
@@ -186,7 +213,15 @@ class OpenCodeClient:
     async def abort_message(self, session_id: str) -> dict:
         resp = await self.client.post(f"/session/{session_id}/abort")
         resp.raise_for_status()
-        return resp.json()
+        result = self._parse_response_body(resp)
+        if result is None:
+            result = True
+        return self._coerce_action_result(
+            result,
+            flag_key="aborted",
+            id_key="session_id",
+            id_value=session_id,
+        )
 
     async def fork_session(self, session_id: str) -> dict:
         resp = await self.client.post(f"/session/{session_id}/fork")
@@ -217,7 +252,15 @@ class OpenCodeClient:
     async def close_pty(self, pty_id: str) -> dict:
         resp = await self.client.delete(f"/pty/{pty_id}")
         resp.raise_for_status()
-        return resp.json()
+        result = self._parse_response_body(resp)
+        if result is None:
+            result = True
+        return self._coerce_action_result(
+            result,
+            flag_key="closed",
+            id_key="pty_id",
+            id_value=pty_id,
+        )
 
     async def update_session(self, session_id: str, **kwargs) -> dict:
         """Update session properties.
