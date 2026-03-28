@@ -37,6 +37,8 @@ structlog.configure(
 logger = structlog.get_logger()
 
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", secrets.token_hex(32))
+MCP_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "opencode-mcp-gateway")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
 OPENCODE_HOST = os.environ.get("OPENCODE_HOST", "localhost")
 OPENCODE_PORT = int(os.environ.get("OPENCODE_PORT", "9999"))
@@ -50,6 +52,34 @@ session_mgr = cast(SessionManager, None)
 pty_mgr = cast(PtyManager, None)
 
 auth_codes = {}
+
+
+def _resolve_base_url(request: Request) -> str:
+    """Resolve externally visible base URL for OAuth metadata.
+
+    If PUBLIC_BASE_URL is provided, use it as a stable override (useful when
+    reverse-proxying this gateway behind a path prefix like /desktop).
+    Otherwise derive from forwarded headers/host.
+    """
+    if PUBLIC_BASE_URL:
+        base_url = PUBLIC_BASE_URL
+    else:
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+        scheme = forwarded_proto or request.url.scheme
+        forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+        host = forwarded_host or request.headers.get("host") or request.url.netloc
+        base_url = f"{scheme}://{host}".rstrip("/")
+
+    if request.url.path.endswith("/mcp") and not base_url.endswith("/mcp"):
+        return f"{base_url}/mcp"
+    return base_url
+
+
+def _resolve_resource_base(request: Request) -> str:
+    base_url = _resolve_base_url(request)
+    if base_url.endswith("/mcp"):
+        return base_url[:-4]
+    return base_url
 
 
 def create_fastmcp() -> FastMCP:
@@ -461,7 +491,7 @@ async def handle_oauth_authorize(request: Request):
         code_challenge_method=code_challenge_method,
     )
 
-    if not secrets.compare_digest(client_id, "opencode-mcp-gateway"):
+    if not secrets.compare_digest(client_id, MCP_CLIENT_ID):
         logger.warning("oauth_authorize_invalid_client", client_id=client_id)
         return HTMLResponse("<h1>Invalid client_id</h1>", status_code=400)
 
@@ -471,7 +501,7 @@ async def handle_oauth_authorize(request: Request):
 
     code = secrets.token_hex(32)
     auth_codes[code] = {
-        "client_id": "opencode-mcp-gateway",
+        "client_id": MCP_CLIENT_ID,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "scope": scope,
@@ -501,7 +531,7 @@ async def handle_oauth_authorize_post(request: Request) -> RedirectResponse:
     scope = form.get("scope", "mcp")
 
     auth_codes[code] = {
-        "client_id": "opencode-mcp-gateway",
+        "client_id": MCP_CLIENT_ID,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "scope": scope,
@@ -585,6 +615,16 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
                 )
                 return JSONResponse({"error": "code_expired"}, status_code=400)
 
+            auth_client_id = str(auth_info.get("client_id", ""))
+            if client_id and auth_client_id and not secrets.compare_digest(client_id, auth_client_id):
+                logger.warning(
+                    "oauth_client_id_mismatch",
+                    client_id=client_id,
+                    expected_client_id=auth_client_id,
+                    code_prefix=code[:8],
+                )
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+
             code_challenge = str(auth_info.get("code_challenge", ""))
             if code_challenge:
                 if not code_verifier:
@@ -611,7 +651,7 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
             else:
                 # Confidential client fallback for authorization_code flows without PKCE.
                 if not (
-                    secrets.compare_digest(client_id, "opencode-mcp-gateway")
+                    secrets.compare_digest(client_id, MCP_CLIENT_ID)
                     and secrets.compare_digest(client_secret, AUTH_TOKEN)
                 ):
                     logger.warning(
@@ -628,7 +668,7 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
             })
 
         if grant_type == "client_credentials" and \
-           secrets.compare_digest(client_id, "opencode-mcp-gateway") and \
+           secrets.compare_digest(client_id, MCP_CLIENT_ID) and \
            secrets.compare_digest(client_secret, AUTH_TOKEN):
             return JSONResponse({
                 "access_token": AUTH_TOKEN,
@@ -720,12 +760,7 @@ class BearerAuthMiddleware:
 
 async def handle_oauth_discovery(request: Request) -> JSONResponse:
     """OAuth authorization server discovery endpoint."""
-    path = request.url.path
-    base_url = "https://mcp.homunculi.cloud"
-    
-    # ChatGPT expects endpoints with /mcp suffix
-    if path.endswith("/mcp"):
-        base_url = "https://mcp.homunculi.cloud/mcp"
+    base_url = _resolve_base_url(request)
     
     return JSONResponse({
         "issuer": base_url,
@@ -735,15 +770,16 @@ async def handle_oauth_discovery(request: Request) -> JSONResponse:
         "scopes_supported": ["mcp", "openid", "profile", "email"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "client_credentials"],
-        "mcp_client_id": "opencode-mcp-gateway",
+        "mcp_client_id": MCP_CLIENT_ID,
     })
 
 
 async def handle_protected_resource(request: Request) -> JSONResponse:
     """Protected resource metadata endpoint (RFC 9728)."""
+    resource_base = _resolve_resource_base(request)
     return JSONResponse({
-        "resource": "https://mcp.homunculi.cloud",
-        "authorization_servers": ["https://mcp.homunculi.cloud"],
+        "resource": resource_base,
+        "authorization_servers": [resource_base],
         "scopes_supported": ["mcp", "openid", "profile", "email"],
         "bearer_methods_supported": ["header"],
     })

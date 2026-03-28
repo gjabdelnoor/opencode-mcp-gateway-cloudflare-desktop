@@ -108,10 +108,20 @@ sudo journalctl -u opencode-mcp-gateway -n 100 --no-pager
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_AUTH_TOKEN` | (auto-generated) | Bearer token |
+| `MCP_CLIENT_ID` | opencode-mcp-gateway | OAuth client ID expected by this gateway |
 | `OPENCODE_HOST` | localhost | OpenCode API host |
 | `OPENCODE_PORT` | 9999 | OpenCode API port |
 | `GATEWAY_PORT` | 3001 | Gateway HTTP port |
 | `ENABLE_RAW_BASH` | true | Enables direct `bash`/`bash_exec` command tool |
+| `PUBLIC_BASE_URL` | (auto-detected) | Override externally visible OAuth base URL (useful behind path prefixes like `/desktop`) |
+
+## Second Connector On Same Domain
+
+You can expose a second gateway on the same domain using a path prefix, for example `/desktop`.
+
+- Run the second gateway with `PUBLIC_BASE_URL=https://mcp.homunculi.cloud/desktop`
+- Route `https://mcp.homunculi.cloud/desktop/*` to that second gateway, stripping the `/desktop` prefix at the reverse proxy
+- Register ChatGPT connector URL as `https://mcp.homunculi.cloud/desktop/mcp`
 
 ## Security Note
 
