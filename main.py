@@ -55,31 +55,56 @@ def create_fastmcp() -> FastMCP:
     )
 
     @mcp.tool()
-    def session_list() -> list[dict]:
-        """List all OpenCode sessions."""
+    def list_sessions(cursor: str = None, limit: int = 10) -> dict:
+        """List OpenCode sessions with pagination.
+
+        Returns all known sessions (up to limit) with recent message previews.
+        Use cursor from previous response to get next page.
+
+        Args:
+            cursor: Cursor from previous response to get next page (optional)
+            limit: Maximum sessions to return (default 10, max 50)
+        """
         import asyncio
-        return asyncio.get_event_loop().run_until_complete(session_mgr.list_sessions())
+        limit = min(limit, 50)
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.list_sessions(cursor=cursor, limit=limit)
+        )
 
     @mcp.tool()
-    def session_create(title: str = None, directory: str = None, mode: str = None, auto_accept: bool = False) -> dict:
-        """Create a new OpenCode session.
-        
+    def session_create(
+        initial_message: str,
+        title: str = None,
+        directory: str = None,
+        mode: str = "planning",
+        auto_accept: bool = False
+    ) -> dict:
+        """Create a new OpenCode session with mandatory initial message.
+
+        Creates a new session in planning mode by default, sends the initial message,
+        and returns the response. The session will be in planning mode until you
+        explicitly switch it to building mode.
+
         Args:
+            initial_message: REQUIRED - First message to send to the session
             title: Optional session title
             directory: Optional working directory
-            mode: 'planning' for thoughtful reasoning or 'building' for action (optional)
+            mode: 'planning' (default) or 'building' - mode for the new session
             auto_accept: If True, sets permissions to allow all (no permission prompts)
         """
         import asyncio
         permissions = None
         if auto_accept:
             permissions = [{"permission": "*", "pattern": "*", "action": "allow"}]
-        result = asyncio.get_event_loop().run_until_complete(
-            session_mgr.create_session(title=title, directory=directory, permissions=permissions)
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.create_session(
+                initial_message=initial_message,
+                title=title,
+                directory=directory,
+                mode=mode,
+                permissions=permissions
+            )
         )
-        if mode and mode in ("planning", "building"):
-            session_mgr.set_session_mode(result.get("id", ""), mode)
-        return result
 
     @mcp.tool()
     def session_get(session_id: str) -> dict:
@@ -100,16 +125,21 @@ def create_fastmcp() -> FastMCP:
         return asyncio.get_event_loop().run_until_complete(session_mgr.fork_session(session_id))
 
     @mcp.tool()
-    def message_send(session_id: str, prompt: str) -> str:
-        """Send a prompt to a session."""
+    def send_message(session_id: str, prompt: str) -> dict:
+        """Send a message to a session with timeout handling.
+
+        Sends the message and waits for OpenCode's response. If the response
+        takes too long (approaching 50s timeout), returns partial result with
+        still_active=True. Use read_session_logs to get full output.
+
+        Args:
+            session_id: The session ID to send the message to
+            prompt: The message text
+        """
         import asyncio
-        result = []
-        async def collect():
-            async for event in await session_mgr.send_message(session_id, prompt):
-                result.append(event)
-        asyncio.get_event_loop().run_until_complete(collect())
-        import json
-        return json.dumps(result)
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.send_message(session_id, prompt)
+        )
 
     @mcp.tool()
     def message_abort(session_id: str) -> dict:
@@ -154,10 +184,22 @@ def create_fastmcp() -> FastMCP:
         }
 
     @mcp.tool()
-    def read_session(session_id: str) -> dict:
-        """Read a session's full details."""
+    def read_session_logs(session_id: str, mode: str = "summary") -> dict:
+        """Read session logs (non-blocking).
+
+        Read a session's message history without waiting. Use this to check
+        session output divorced from wait_for_session monitoring.
+
+        Args:
+            session_id: The session ID
+            mode: "summary" (last 3 messages, default) or "full" (all messages)
+        """
         import asyncio
-        return asyncio.get_event_loop().run_until_complete(session_mgr.get_session(session_id))
+        if mode not in ("summary", "full"):
+            mode = "summary"
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.read_session_logs(session_id, mode=mode)
+        )
 
     @mcp.tool()
     def switch_session(session_id: str) -> dict:
@@ -170,13 +212,22 @@ def create_fastmcp() -> FastMCP:
         return session_mgr.set_session_model(session_id, model)
 
     @mcp.tool()
-    def switch_mode(session_id: str, mode: str) -> dict:
-        """Switch a session between 'planning' and 'building' mode.
-        
-        Planning mode is more thoughtful/reflective, suitable for designing and reasoning.
-        Building mode is more action-oriented, suitable for implementing code changes.
+    def switch_mode_and_send(session_id: str, mode: str, message: str) -> dict:
+        """Switch a session to a different mode AND send a message in one call.
+
+        This is the primary way to transition from planning to building mode.
+        Switching mode and sending a message together ensures the agent
+        understands the context of why the mode changed.
+
+        Args:
+            session_id: The session ID
+            mode: Target mode - 'planning' or 'building'
+            message: Message to send after switching mode (e.g., "Now build this plan")
         """
-        return session_mgr.set_session_mode(session_id, mode)
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.switch_mode_and_send(session_id, mode, message)
+        )
 
     @mcp.tool()
     def get_session_mode(session_id: str) -> dict:
@@ -193,7 +244,7 @@ def create_fastmcp() -> FastMCP:
     @mcp.tool()
     def set_permissions(session_id: str, permissions: list) -> dict:
         """Set permissions for a session.
-        
+
         Args:
             session_id: The session ID
             permissions: List of permission dicts, e.g., [{"permission": "*", "pattern": "*", "action": "allow"}]
@@ -207,7 +258,7 @@ def create_fastmcp() -> FastMCP:
     @mcp.tool()
     def auto_accept_permissions(session_id: str) -> dict:
         """Enable auto-accept (allow all) permissions for a session.
-        
+
         This removes all permission prompts for the session.
         """
         permissions = [{"permission": "*", "pattern": "*", "action": "allow"}]
@@ -218,15 +269,19 @@ def create_fastmcp() -> FastMCP:
 
     @mcp.tool()
     def wait_for_session(session_id: str, duration: int = 50) -> dict:
-        """Wait for a session and collect activity summary.
-        
-        Monitors a session for the specified duration (default 50 seconds),
-        collecting tool calls, outputs, and internal reasoning. Returns a summary
-        suitable for deciding if the agent needs steering/correction.
-        
+        """Wait for a session and collect activity.
+
+        Monitors a session for the specified duration, collecting tool calls,
+        outputs, and internal reasoning. Returns a summary of activity suitable
+        for deciding if the agent needs steering/correction.
+
+        Minimum duration is 30 seconds. If session still active near timeout,
+        returns partial results with still_active=True and flavor text suggesting
+        to use read_session_logs.
+
         Args:
             session_id: The session ID to monitor
-            duration: Seconds to wait (default 50)
+            duration: Seconds to wait (minimum 30, default 50)
         """
         import asyncio
         return asyncio.get_event_loop().run_until_complete(

@@ -18,25 +18,27 @@ def event_loop():
 
 @pytest.fixture
 def mock_opencode_client():
-    """Create a mock OpenCode client."""
+    """Create a fresh mock OpenCode client for each test."""
     client = MagicMock(spec=OpenCodeClient)
     client.list_sessions = AsyncMock(return_value=[])
     client.get_session = AsyncMock(return_value={
         "id": "test-session-1",
         "title": "Test Session",
         "directory": "/tmp",
+        "messages": [],
         "time": {"created": 1234567890, "updated": 1234567890}
     })
     client.create_session = AsyncMock(return_value={"id": "new-session-1", "title": "New Session"})
     client.delete_session = AsyncMock(return_value={"success": True})
     client.send_message = AsyncMock(return_value={"response": "test response"})
-    client.stream_message = AsyncMock()
+    client.stream_message = MagicMock(return_value=iter([]))
     client.abort_message = AsyncMock(return_value={"aborted": True})
     client.fork_session = AsyncMock(return_value={"id": "forked-session-1"})
     client.create_pty = AsyncMock(return_value={"id": "pty-1"})
     client.resize_pty = AsyncMock(return_value={"success": True})
     client.get_pty_output = AsyncMock(return_value={"data": "test output"})
     client.close_pty = AsyncMock(return_value={"success": True})
+    client.update_session = AsyncMock(return_value={"success": True})
     return client
 
 
