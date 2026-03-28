@@ -61,12 +61,25 @@ def create_fastmcp() -> FastMCP:
         return asyncio.get_event_loop().run_until_complete(session_mgr.list_sessions())
 
     @mcp.tool()
-    def session_create(title: str = None, directory: str = None) -> dict:
-        """Create a new OpenCode session."""
+    def session_create(title: str = None, directory: str = None, mode: str = None, auto_accept: bool = False) -> dict:
+        """Create a new OpenCode session.
+        
+        Args:
+            title: Optional session title
+            directory: Optional working directory
+            mode: 'planning' for thoughtful reasoning or 'building' for action (optional)
+            auto_accept: If True, sets permissions to allow all (no permission prompts)
+        """
         import asyncio
-        return asyncio.get_event_loop().run_until_complete(
-            session_mgr.create_session(title=title, directory=directory)
+        permissions = None
+        if auto_accept:
+            permissions = [{"permission": "*", "pattern": "*", "action": "allow"}]
+        result = asyncio.get_event_loop().run_until_complete(
+            session_mgr.create_session(title=title, directory=directory, permissions=permissions)
         )
+        if mode and mode in ("planning", "building"):
+            session_mgr.set_session_mode(result.get("id", ""), mode)
+        return result
 
     @mcp.tool()
     def session_get(session_id: str) -> dict:
@@ -157,10 +170,68 @@ def create_fastmcp() -> FastMCP:
         return session_mgr.set_session_model(session_id, model)
 
     @mcp.tool()
+    def switch_mode(session_id: str, mode: str) -> dict:
+        """Switch a session between 'planning' and 'building' mode.
+        
+        Planning mode is more thoughtful/reflective, suitable for designing and reasoning.
+        Building mode is more action-oriented, suitable for implementing code changes.
+        """
+        return session_mgr.set_session_mode(session_id, mode)
+
+    @mcp.tool()
+    def get_session_mode(session_id: str) -> dict:
+        """Get the current mode of a session (planning or building)."""
+        mode = session_mgr.get_session_mode(session_id)
+        return {"session_id": session_id, "mode": mode}
+
+    @mcp.tool()
     def get_active_session() -> dict:
         """Get the currently active session."""
         active_id = session_mgr.get_active_session()
         return {"active_session_id": active_id}
+
+    @mcp.tool()
+    def set_permissions(session_id: str, permissions: list) -> dict:
+        """Set permissions for a session.
+        
+        Args:
+            session_id: The session ID
+            permissions: List of permission dicts, e.g., [{"permission": "*", "pattern": "*", "action": "allow"}]
+                       Valid actions: "allow", "deny", "ask"
+        """
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.set_session_permissions(session_id, permissions)
+        )
+
+    @mcp.tool()
+    def auto_accept_permissions(session_id: str) -> dict:
+        """Enable auto-accept (allow all) permissions for a session.
+        
+        This removes all permission prompts for the session.
+        """
+        permissions = [{"permission": "*", "pattern": "*", "action": "allow"}]
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.set_session_permissions(session_id, permissions)
+        )
+
+    @mcp.tool()
+    def wait_for_session(session_id: str, duration: int = 50) -> dict:
+        """Wait for a session and collect activity summary.
+        
+        Monitors a session for the specified duration (default 50 seconds),
+        collecting tool calls, outputs, and internal reasoning. Returns a summary
+        suitable for deciding if the agent needs steering/correction.
+        
+        Args:
+            session_id: The session ID to monitor
+            duration: Seconds to wait (default 50)
+        """
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            session_mgr.wait_for_session(session_id, duration)
+        )
 
     return mcp
 
