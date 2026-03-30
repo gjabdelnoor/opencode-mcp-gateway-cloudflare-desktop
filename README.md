@@ -331,7 +331,7 @@ The gateway now validates against OpenCode’s live model catalog.
 It will reject:
 
 - anything not currently exposed by OpenCode
-- the two known-bad blocked models:
+- I may have hardcoded it to reject the two known-bad models on my minimax plan... oops:
   - `minimax-coding-plan/MiniMax-M2.5-highspeed`
   - `minimax-coding-plan/MiniMax-M2.7-highspeed`
 
