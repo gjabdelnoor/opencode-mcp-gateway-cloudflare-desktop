@@ -1,4 +1,4 @@
-# OpenCode MCP Gateway
+# OpenCode MCP Gateway Cloudflare Desktop
 
 > [!WARNING]
 > This project exposes remote shell execution, PTY control, session steering, and agent-driven code execution on the machine where it runs.
@@ -6,19 +6,23 @@
 > If this gateway is compromised, an attacker may be able to read files, execute commands, access credentials, damage data, or pivot deeper into your environment.
 > Do not expose it to untrusted users. Use strong secrets. Keep the origin machine locked down.
 
-This repository exposes a local OpenCode server as a remote MCP server for Claude and ChatGPT using OAuth and Cloudflare Tunnel.
+This repository is the Cloudflare desktop deployment variant of `opencode-mcp-gateway`.
 
-The deployment model this repo is optimized for is:
+It is designed for:
 
-- Ubuntu desktop or laptop
-- OpenCode running locally on `127.0.0.1:9999`
-- This gateway running locally on `127.0.0.1:3001`
-- Cloudflare Tunnel providing the public HTTPS endpoint
-- No VPS required
+- an Ubuntu desktop or laptop
+- a local OpenCode server
+- a public HTTPS MCP endpoint fronted by Cloudflare Tunnel
+- Claude and ChatGPT OAuth-compatible remote MCP usage
+- no VPS
+
+Repository:
+
+- `https://github.com/gjabdelnoor/opencode-mcp-gateway-cloudflare-desktop`
 
 ## Tested Status
 
-This setup has been exercised against a real desktop-origin deployment behind Cloudflare Tunnel.
+This repo has been exercised against a real desktop-origin deployment behind Cloudflare Tunnel.
 
 Validated:
 
@@ -30,35 +34,92 @@ Validated:
 - session tools
 - PTY tools
 - direct bash tools
+- multi-gateway deployment (`mcp1` through `mcp6`)
+- concurrent agent usage across multiple public gateways
 
-Latest smoke test status: `20/20` tool paths working on the live deployment.
+Latest smoke test status: `20/20` tool paths working on the live passthrough deployment.
 
-Important implementation fixes in this repo:
+## What We Now Know
 
-- Claude-compatible `WWW-Authenticate` handling on `/mcp` `401` responses
-- protected resource metadata advertising the actual MCP resource URL
-- auth-code validation for `redirect_uri` and `resource`
-- websocket-backed PTY I/O for `bash_write` and `bash_read`
-- session prompt handling via `prompt_async` plus polling instead of relying on empty immediate message responses
-- optional per-mode default model overrides so the gateway can bypass broken OpenCode defaults
+This is the distilled set of things that the older or upstream version did not reflect clearly enough.
 
-## What This Repo Does
+### 1. Cloudflare Tunnel is a real desktop deployment path
 
-It sits between remote MCP clients and a local OpenCode server.
+You do not need a VPS.
 
-High-level flow:
+If your desktop is on, and both OpenCode and the gateway are running locally, Cloudflare Tunnel can expose the MCP server publicly over HTTPS.
+
+### 2. Claude compatibility depends on real OAuth/MCP details
+
+For Claude to work reliably, the gateway needs:
+
+- `WWW-Authenticate` with `resource_metadata` on `/mcp` `401` responses
+- protected resource metadata that advertises the actual MCP resource URL
+- correct `redirect_uri` and `resource` validation during auth-code exchange
+
+Without those, Claude may reach the login screen but still fail the connector handshake.
+
+### 3. OpenCode PTY I/O is websocket-backed
+
+`bash_write` and `bash_read` cannot be implemented correctly against the old REST assumptions.
+
+OpenCode PTY interaction uses websocket transport, and this repo now uses that transport directly.
+
+### 4. Empty assistant responses were often backend/model issues, not MCP transport failures
+
+The original “stalled” session behavior was frequently OpenCode retrying an unsupported model.
+
+This repo now surfaces backend retry state more clearly and supports default planning/building model overrides.
+
+### 5. Session roots were not being set correctly by the original request shape
+
+OpenCode expects the session `directory` on the `/session` request as a query parameter, not in the JSON body.
+
+This repo now uses the right request shape and supports `DEFAULT_WORKSPACE_DIR`.
+
+### 6. Multiple public gateways need unique OAuth client IDs
+
+If all gateways advertise the same client ID, connector credential caching can collide across endpoints.
+
+This repo uses unique client IDs per public gateway when you run multiple instances.
+
+### 7. Model switching should not blindly trust arbitrary user input
+
+This repo now validates `switch_model` against the live OpenCode provider/model catalog.
+
+It also explicitly blocks two known-bad variants that were manually confirmed not to work reliably here:
+
+- `minimax-coding-plan/MiniMax-M2.5-highspeed`
+- `minimax-coding-plan/MiniMax-M2.7-highspeed`
+
+### 8. Agents need a better way to find relevant sessions
+
+This repo now includes a recent-session discovery tool with a one-week cutoff:
+
+- `list_recent_sessions(limit=10, days=7)`
+
+## Architecture
 
 ```text
-Claude / ChatGPT -> Cloudflare -> cloudflared tunnel -> gateway -> OpenCode
-```
-
-Concrete example:
-
-```text
-Claude / ChatGPT -> https://mcp.example.com/mcp
-                    -> Cloudflare Tunnel
-                    -> http://127.0.0.1:3001
-                    -> http://127.0.0.1:9999
+Claude / ChatGPT
+        |
+        v
+  https://mcp.example.com/mcp
+        |
+        v
+   Cloudflare Edge
+        |
+        v
+   cloudflared tunnel
+        |
+        v
+  http://127.0.0.1:3001
+        |
+        v
+  http://127.0.0.1:9999
+        |
+        v
+      OpenCode
 ```
 
 ## Read This First
@@ -71,11 +132,44 @@ OpenCode docs:
 - Providers: `https://opencode.ai/docs/providers/`
 - Server mode: `https://opencode.ai/docs/server/`
 
-If you want the full expanded walkthrough in this repo, read:
+Detailed docs in this repo:
 
 - `docs/ubuntu-cloudflare-desktop-setup.md`
+- `docs/session-change-map.md`
 
-## Quick Setup
+## Installation Paths
+
+There are two practical install paths documented here.
+
+### Path A: Purchased Domain + Cloudflare DNS
+
+This is the recommended path.
+
+Use this when you want a stable hostname like:
+
+- `https://mcp.example.com/mcp`
+
+Why this is better:
+
+- stable OAuth issuer URL
+- stable connector configuration
+- better long-term reliability
+- easier to run multiple gateways like `mcp1`, `mcp2`, `mcp3`
+
+### Path B: Free Cloudflare `trycloudflare` Tunnel
+
+This is the free, no-personal-domain path.
+
+Use this when you want to experiment without buying or wiring a domain.
+
+Why this is worse:
+
+- hostname is temporary
+- hostname can change on reconnect
+- OAuth clients may break when the issuer URL changes
+- not ideal for durable Claude or ChatGPT connectors
+
+## Quick Start
 
 ### 1. Install Ubuntu packages
 
@@ -86,19 +180,15 @@ sudo apt install -y curl git python3 python3-pip python3-venv
 
 ### 2. Install and configure OpenCode
 
-Install OpenCode:
-
 ```bash
 curl -fsSL https://opencode.ai/install | bash
 ```
 
-Then follow the OpenCode docs to configure a provider and start the local server:
+Then configure a provider and start OpenCode locally:
 
 ```bash
 opencode serve --hostname 127.0.0.1 --port 9999
 ```
-
-Leave that running.
 
 ### 3. Clone this repo and install dependencies
 
@@ -123,6 +213,7 @@ MCP_AUTH_TOKEN=replace-with-a-long-random-secret
 MCP_CLIENT_ID=opencode-mcp-gateway
 MCP_ALLOWED_CLIENT_IDS=opencode-mcp-gateway
 PUBLIC_BASE_URL=https://mcp.example.com
+DEFAULT_WORKSPACE_DIR="/home/YOUR_USER/AI Projects"
 OPENCODE_HOST=127.0.0.1
 OPENCODE_PORT=9999
 GATEWAY_PORT=3001
@@ -131,41 +222,27 @@ DEFAULT_PLANNING_MODEL=opencode/minimax-m2.5-free
 DEFAULT_BUILDING_MODEL=openai/gpt-5.4-mini
 ```
 
-Notes:
+### 5. Choose a tunnel path
 
-- `PUBLIC_BASE_URL` must be the final external HTTPS URL.
-- `DEFAULT_PLANNING_MODEL` and `DEFAULT_BUILDING_MODEL` are strongly recommended if your OpenCode default models are not actually usable with your account.
+#### Purchased domain path
 
-### 5. Install `cloudflared`
+Install `cloudflared`:
 
 ```bash
 curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 sudo dpkg -i cloudflared.deb
 rm cloudflared.deb
-cloudflared --version
 ```
 
-### 6. Add your domain to Cloudflare and create a tunnel
-
-Authenticate:
+Authenticate and create the tunnel:
 
 ```bash
 cloudflared tunnel login
-```
-
-Create the tunnel:
-
-```bash
 cloudflared tunnel create opencode-mcp-gateway
-```
-
-Create the DNS route:
-
-```bash
 cloudflared tunnel route dns opencode-mcp-gateway mcp.example.com
 ```
 
-### 7. Create `~/.cloudflared/config.yml`
+Create `~/.cloudflared/config.yml`:
 
 ```yaml
 tunnel: YOUR_TUNNEL_ID
@@ -179,28 +256,45 @@ ingress:
   - service: http_status:404
 ```
 
-### 8. Start the gateway
+Set:
+
+- `PUBLIC_BASE_URL=https://mcp.example.com`
+
+Run the tunnel:
+
+```bash
+cloudflared tunnel run opencode-mcp-gateway
+```
+
+#### Free `trycloudflare` path
+
+Install `cloudflared` the same way, then run:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:3001
+```
+
+That gives you a temporary `https://...trycloudflare.com` URL.
+
+Use that URL as:
+
+- `PUBLIC_BASE_URL=https://YOUR-TEMP-HOST.trycloudflare.com`
+
+Important caveat:
+
+- this path is still considered experimental here
+- if the hostname changes, you will usually need to recreate the connector in Claude or ChatGPT
+
+### 6. Start the gateway
 
 ```bash
 source .venv/bin/activate
 python main.py
 ```
 
-### 9. Start the tunnel
-
-```bash
-cloudflared tunnel run opencode-mcp-gateway
-```
-
-At that point you should have three live processes:
-
-1. `opencode serve --hostname 127.0.0.1 --port 9999`
-2. `python main.py`
-3. `cloudflared tunnel run opencode-mcp-gateway`
-
 ## Verify The Deployment
 
-Public checks:
+Check:
 
 ```bash
 curl https://mcp.example.com/.well-known/oauth-authorization-server
@@ -209,12 +303,12 @@ curl https://mcp.example.com/.well-known/oauth-protected-resource
 curl -D - -o /dev/null https://mcp.example.com/mcp
 ```
 
-What you want to see:
+You want:
 
 - OAuth issuer: `https://mcp.example.com`
 - token endpoint: `https://mcp.example.com/oauth/token`
 - protected resource: `https://mcp.example.com/mcp`
-- unauthenticated `/mcp` returns `401` with `WWW-Authenticate` including `resource_metadata`
+- unauthorized `/mcp` returns `401` with `WWW-Authenticate` and `resource_metadata`
 
 ## Connect ChatGPT Or Claude
 
@@ -236,11 +330,9 @@ Manual OAuth values when needed:
 - Token auth method: `client_secret_post`
 - Scope: `mcp`
 
-This repo does not implement dynamic client registration. Manual client configuration is the expected path.
-
 ## Multiple Concurrent Agents
 
-If you want several Claude or ChatGPT conversations controlling separate agents at once, run multiple gateway processes instead of sharing a single gateway instance.
+If you want multiple chatbot-controlled agents at once, run multiple gateway processes.
 
 Recommended layout:
 
@@ -256,10 +348,7 @@ Each instance should have its own:
 - `PUBLIC_BASE_URL`
 - `GATEWAY_PORT`
 - `MCP_AUTH_TOKEN`
-- optional `DEFAULT_PLANNING_MODEL`
-- optional `DEFAULT_BUILDING_MODEL`
-
-This repo includes `scripts/run-gateway-instance.sh` for per-instance startup with dedicated env files.
+- `MCP_CLIENT_ID`
 
 ## Configuration
 
@@ -269,12 +358,14 @@ This repo includes `scripts/run-gateway-instance.sh` for per-instance startup wi
 | `MCP_CLIENT_ID` | Main OAuth client ID accepted by the gateway |
 | `MCP_ALLOWED_CLIENT_IDS` | Optional comma-separated allowlist of additional client IDs |
 | `PUBLIC_BASE_URL` | External HTTPS base URL advertised in OAuth metadata |
+| `DEFAULT_WORKSPACE_DIR` | Default project root for new sessions and PTYs |
 | `OPENCODE_HOST` | OpenCode origin host |
 | `OPENCODE_PORT` | OpenCode origin port |
 | `GATEWAY_PORT` | Gateway listen port |
 | `ENABLE_RAW_BASH` | Enables direct `bash` and `bash_exec` tools |
-| `DEFAULT_PLANNING_MODEL` | Optional fallback model used for planning-mode sessions |
-| `DEFAULT_BUILDING_MODEL` | Optional fallback model used for building-mode sessions |
+| `DEFAULT_PLANNING_MODEL` | Optional fallback model for planning-mode sessions |
+| `DEFAULT_BUILDING_MODEL` | Optional fallback model for building-mode sessions |
+| `BLOCKED_SESSION_MODELS` | Optional comma-separated models to reject even if OpenCode advertises them |
 
 ## Troubleshooting
 
@@ -286,37 +377,16 @@ Use the full MCP URL:
 https://mcp.example.com/mcp
 ```
 
-Do not enter only the hostname.
+### Claude reaches login but the connector still fails
 
-### Claude OAuth fails after the browser redirect
-
-Check all of these:
+Check:
 
 - `PUBLIC_BASE_URL` is correct
 - protected resource metadata returns `https://mcp.example.com/mcp`
 - `GET /mcp` without auth returns `401` with `WWW-Authenticate`
-- Claude is pointed at `https://mcp.example.com/mcp`
 - the OAuth client secret exactly matches `MCP_AUTH_TOKEN`
 
-### Cloudflare returns `502`
-
-Usually one of these:
-
-- OpenCode is not running
-- `python main.py` is not running
-- `cloudflared` is not running
-- the tunnel points at the wrong local port
-
-Local checks:
-
-```bash
-curl http://127.0.0.1:9999/global/health
-curl http://127.0.0.1:3001/health
-```
-
 ### `session_create` or `send_message` looks stalled
-
-This is often not an OAuth problem.
 
 Check:
 
@@ -324,64 +394,42 @@ Check:
 curl http://127.0.0.1:9999/session/status
 ```
 
-If OpenCode is retrying an unsupported model, set gateway defaults such as:
+If OpenCode is retrying an unsupported model, set or adjust:
 
 ```bash
 DEFAULT_PLANNING_MODEL=opencode/minimax-m2.5-free
 DEFAULT_BUILDING_MODEL=openai/gpt-5.4-mini
 ```
 
-### Planning mode refuses command execution
+### `switch_model` rejects a model you thought should work
 
-That is expected behavior.
+The gateway now validates against OpenCode’s live model catalog.
 
-Planning mode is for analysis and planning. Use building mode for command execution and editing tasks.
+It will reject:
 
-### `bash_write` and `bash_read` return noisy terminal output
+- anything not currently exposed by OpenCode
+- the two known-bad blocked models:
+  - `minimax-coding-plan/MiniMax-M2.5-highspeed`
+  - `minimax-coding-plan/MiniMax-M2.7-highspeed`
 
-That is expected.
+### Sessions are starting in the wrong folder
 
-PTY output is real terminal output and can contain ANSI escape sequences, shell prompt control codes, and cursor state markers.
+Set:
+
+```bash
+DEFAULT_WORKSPACE_DIR="/home/YOUR_USER/AI Projects"
+```
+
+This repo now defaults new sessions and PTYs to that workspace if you do not pass an explicit directory.
 
 ### Several bots interfere with each other
 
 Use separate gateway instances on separate hostnames and ports.
 
-Sharing one in-memory gateway process between many active bots is riskier than isolating them.
-
-## Appendix: Theoretical Free Setup Without Personal DNS
-
-This is not tested in this repo.
-
-If you want a completely free path, the theoretical option is to use an ephemeral `trycloudflare.com` hostname instead of a personal domain.
-
-The rough flow would be:
-
-1. Start OpenCode locally
-2. Start this gateway locally
-3. Run a quick tunnel command
-4. Use the temporary hostname as `PUBLIC_BASE_URL`
-
-Example:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:3001
-```
-
-Why this is not recommended for stable use:
-
-- hostname changes across reconnects
-- OAuth issuer URL changes break client setup
-- reconnecting may invalidate saved connector config
-- it is worse for repeatable setup and long-term reliability
-
-Use it only for experimentation.
-
-## Detailed Guide
-
-For the full Ubuntu-from-scratch walkthrough, use:
+## Full Docs
 
 - `docs/ubuntu-cloudflare-desktop-setup.md`
+- `docs/session-change-map.md`
 
 ## Questions Or Security Concerns
 

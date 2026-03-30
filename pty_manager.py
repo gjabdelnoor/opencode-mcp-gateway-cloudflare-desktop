@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Optional
 import structlog
@@ -25,6 +26,8 @@ class PtyManager:
         self.oc = oc_client
         self.ptys: dict[str, PtyInfo] = {}
         self._lock = asyncio.Lock()
+        default_workspace_dir = os.environ.get("DEFAULT_WORKSPACE_DIR", "").strip()
+        self.default_workspace_dir = default_workspace_dir or None
 
     async def create_pty(
         self,
@@ -36,6 +39,7 @@ class PtyManager:
         env: Optional[dict[str, str]] = None,
     ) -> dict:
         """Create a new PTY for Claude."""
+        cwd = cwd or self.default_workspace_dir
         async with self._lock:
             result = await self.oc.create_pty(
                 cwd=cwd,

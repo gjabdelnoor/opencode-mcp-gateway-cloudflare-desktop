@@ -33,6 +33,24 @@ class TestPtyManager:
         assert pty_manager.ptys["pty-1"].owner == "claude"
 
     @pytest.mark.asyncio
+    async def test_create_pty_uses_default_workspace_dir(self, mock_opencode_client):
+        """Test PTYs default to DEFAULT_WORKSPACE_DIR when cwd is omitted."""
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"DEFAULT_WORKSPACE_DIR": "/workspace/root"}):
+            manager = PtyManager(mock_opencode_client)
+
+            await manager.create_pty()
+
+            mock_opencode_client.create_pty.assert_called_once_with(
+                cwd="/workspace/root",
+                command=None,
+                args=None,
+                title=None,
+                env=None,
+            )
+
+    @pytest.mark.asyncio
     async def test_resize_pty(self, pty_manager, mock_opencode_client):
         """Test resizing a PTY."""
         await pty_manager.create_pty(owner="claude")

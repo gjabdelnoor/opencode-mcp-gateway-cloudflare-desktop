@@ -44,6 +44,124 @@ class SessionManager:
         self.default_building_model = (
             os.environ.get("DEFAULT_BUILDING_MODEL", "").strip() or None
         )
+        default_workspace_dir = os.environ.get("DEFAULT_WORKSPACE_DIR", "").strip()
+        self.default_workspace_dir = default_workspace_dir or None
+        self.blocked_session_models = {
+            value.strip()
+            for value in os.environ.get(
+                "BLOCKED_SESSION_MODELS",
+                "minimax-coding-plan/MiniMax-M2.5-highspeed,"
+                "minimax-coding-plan/MiniMax-M2.7-highspeed",
+            ).split(",")
+            if value.strip()
+        }
+        self.allowed_session_models: set[str] = set()
+        self.allowed_model_providers: set[str] = set()
+
+    def _resolve_session_directory(self, directory: Optional[str]) -> Optional[str]:
+        return directory or self.default_workspace_dir
+
+    @staticmethod
+    def _datetime_to_epoch_ms(value: datetime) -> int:
+        return int(value.timestamp() * 1000)
+
+    def _session_activity_timestamp(
+        self,
+        session_id: str,
+        *,
+        created: Optional[int] = None,
+        updated: Optional[int] = None,
+    ) -> int:
+        activity = max(created or 0, updated or 0)
+        info = self.sessions.get(session_id)
+        if info:
+            activity = max(activity, self._datetime_to_epoch_ms(info.last_used))
+        return activity
+
+    async def _build_session_listing_entry(self, sid: str, sess: dict) -> dict:
+        owner = "claude" if sid in self.claude_session_ids else "user"
+        mode = self.session_modes.get(sid, "planning")
+        model = self.session_models.get(sid)
+
+        recent_messages = []
+        try:
+            messages = await self.oc.list_messages(sid, limit=3)
+        except Exception as e:
+            logger.warning("list_recent_messages_failed", session_id=sid, error=str(e))
+            messages = []
+
+        for msg in messages[-3:]:
+            info = msg.get("info", {})
+            parts = msg.get("parts", [])
+            text_chunks = [p.get("text", "") for p in parts if p.get("type") == "text"]
+            recent_messages.append(
+                {
+                    "role": info.get("role"),
+                    "content": "\n".join([t for t in text_chunks if t]).strip()[:300],
+                    "parts_count": len(parts),
+                    "message_id": info.get("id"),
+                }
+            )
+
+        created = sess.get("time", {}).get("created")
+        updated = sess.get("time", {}).get("updated")
+        return {
+            "id": sid,
+            "title": sess.get("title", "Untitled"),
+            "owner": owner,
+            "directory": sess.get("directory"),
+            "created": created,
+            "updated": updated,
+            "last_activity": self._session_activity_timestamp(
+                sid,
+                created=created,
+                updated=updated,
+            ),
+            "model": model,
+            "mode": mode,
+            "is_active": sid == self.active_session_id,
+            "recent_messages": recent_messages,
+        }
+
+    async def refresh_model_catalog(self) -> None:
+        try:
+            catalog = await self.oc.get_provider_catalog()
+        except Exception as e:
+            logger.warning("refresh_model_catalog_failed", error=str(e))
+            return
+
+        providers = catalog.get("providers", [])
+        allowed_models: set[str] = set()
+        allowed_providers: set[str] = set()
+
+        for provider in providers if isinstance(providers, list) else []:
+            provider_id = provider.get("id")
+            if not provider_id:
+                continue
+            allowed_providers.add(provider_id)
+            models = provider.get("models", {})
+            if not isinstance(models, dict):
+                continue
+            for model_id, model_data in models.items():
+                if isinstance(model_data, dict):
+                    status = model_data.get("status")
+                    if status and status != "active":
+                        continue
+                    normalized_model_id = model_data.get("id", model_id)
+                else:
+                    normalized_model_id = model_id
+                model_name = f"{provider_id}/{normalized_model_id}"
+                if model_name in self.blocked_session_models:
+                    continue
+                allowed_models.add(model_name)
+
+        self.allowed_model_providers = allowed_providers
+        self.allowed_session_models = allowed_models
+        logger.info(
+            "refreshed_model_catalog",
+            providers=len(self.allowed_model_providers),
+            models=len(self.allowed_session_models),
+        )
 
     async def refresh_user_sessions(self):
         """Load user's existing sessions from OpenCode."""
@@ -82,6 +200,7 @@ class SessionManager:
             mode: "planning" (default) or "building"
             permissions: Optional permission list for auto-accept
         """
+        directory = self._resolve_session_directory(directory)
         async with self._lock:
             result = await self.oc.create_session(
                 title=title, directory=directory, permissions=permissions
@@ -152,7 +271,10 @@ class SessionManager:
             return self.active_session_id
 
         async with self._lock:
-            created = await self.oc.create_session(title="Raw Bash Session")
+            created = await self.oc.create_session(
+                title="Raw Bash Session",
+                directory=self.default_workspace_dir,
+            )
             new_id = created.get("id")
             if not new_id:
                 raise RuntimeError(
@@ -352,6 +474,12 @@ class SessionManager:
                 )
 
         info = message.get("info", {})
+        finish_reason = info.get("finish")
+        if not finish_reason:
+            for part in reversed(parts):
+                if part.get("type") == "step-finish":
+                    finish_reason = part.get("reason")
+                    break
         return {
             "text": "\n".join(text_chunks).strip(),
             "tool_calls": tool_calls,
@@ -359,6 +487,7 @@ class SessionManager:
             "parts": parts,
             "info": info,
             "completed": bool(info.get("time", {}).get("completed")),
+            "finish_reason": finish_reason,
         }
 
     def _resolve_model_for_session(
@@ -494,7 +623,13 @@ class SessionManager:
                 )
                 if latest:
                     extracted = self._extract_message_activity(latest)
-                    if (
+                    waiting_for_post_tool_text = (
+                        extracted["completed"]
+                        and not extracted["text"]
+                        and extracted["tool_calls"]
+                        and extracted.get("finish_reason") == "tool-calls"
+                    )
+                    if not waiting_for_post_tool_text and (
                         extracted["completed"]
                         or extracted["text"]
                         or extracted["tool_calls"]
@@ -818,50 +953,7 @@ class SessionManager:
         for sid in all_ids[:limit]:
             try:
                 sess = await self.oc.get_session(sid)
-                owner = "claude" if sid in self.claude_session_ids else "user"
-                mode = self.session_modes.get(sid, "planning")
-                model = self.session_models.get(sid)
-
-                recent_messages = []
-                try:
-                    messages = await self.oc.list_messages(sid, limit=3)
-                except Exception as e:
-                    logger.warning(
-                        "list_recent_messages_failed", session_id=sid, error=str(e)
-                    )
-                    messages = []
-
-                for msg in messages[-3:]:
-                    info = msg.get("info", {})
-                    parts = msg.get("parts", [])
-                    text_chunks = [
-                        p.get("text", "") for p in parts if p.get("type") == "text"
-                    ]
-                    recent_messages.append(
-                        {
-                            "role": info.get("role"),
-                            "content": "\n".join([t for t in text_chunks if t]).strip()[
-                                :300
-                            ],
-                            "parts_count": len(parts),
-                            "message_id": info.get("id"),
-                        }
-                    )
-
-                result.append(
-                    {
-                        "id": sid,
-                        "title": sess.get("title", "Untitled"),
-                        "owner": owner,
-                        "directory": sess.get("directory"),
-                        "created": sess.get("time", {}).get("created"),
-                        "updated": sess.get("time", {}).get("updated"),
-                        "model": model,
-                        "mode": mode,
-                        "is_active": sid == self.active_session_id,
-                        "recent_messages": recent_messages,
-                    }
-                )
+                result.append(await self._build_session_listing_entry(sid, sess))
                 last_id = sid
             except Exception as e:
                 logger.warning("failed_to_get_session", session_id=sid, error=str(e))
@@ -873,6 +965,48 @@ class SessionManager:
             "sessions": result,
             "next_cursor": next_cursor,
             "total": len(all_ids),
+        }
+
+    async def list_recent_sessions(self, limit: int = 10, days: int = 7) -> dict:
+        """List recently active sessions ordered by last activity within a cutoff window."""
+        days = max(1, days)
+        limit = min(max(1, limit), 50)
+
+        backend_sessions = await self.oc.list_sessions()
+        self.user_session_ids = {s.id for s in backend_sessions}
+
+        cutoff_ms = int((time.time() - days * 86400) * 1000)
+        candidates: list[tuple[int, Session]] = []
+        for session in backend_sessions:
+            activity = self._session_activity_timestamp(
+                session.id,
+                created=session.created,
+                updated=session.updated,
+            )
+            if activity >= cutoff_ms:
+                candidates.append((activity, session))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        results = []
+        for activity, session in candidates[:limit]:
+            try:
+                sess = await self.oc.get_session(session.id)
+                entry = await self._build_session_listing_entry(session.id, sess)
+                entry["last_activity"] = activity
+                results.append(entry)
+            except Exception as e:
+                logger.warning(
+                    "failed_to_get_recent_session",
+                    session_id=session.id,
+                    error=str(e),
+                )
+
+        return {
+            "sessions": results,
+            "days": days,
+            "cutoff_timestamp": cutoff_ms,
+            "total_recent": len(candidates),
         }
 
     async def read_session_logs(
@@ -983,8 +1117,36 @@ class SessionManager:
         """Get the active session ID."""
         return self.active_session_id
 
-    def set_session_model(self, session_id: str, model: str) -> dict:
+    async def set_session_model(self, session_id: str, model: str) -> dict:
         """Set the model for a session."""
+        await self.refresh_model_catalog()
+
+        if "/" not in model:
+            return {
+                "success": False,
+                "error": "Model must be in provider/model format",
+                "available_providers": sorted(self.allowed_model_providers),
+            }
+
+        if model in self.blocked_session_models:
+            return {
+                "success": False,
+                "error": "Model is disabled on this gateway because it is known not to work reliably",
+                "blocked_models": sorted(self.blocked_session_models),
+            }
+
+        if not self.allowed_session_models:
+            return {
+                "success": False,
+                "error": "OpenCode model catalog is unavailable; cannot validate model switch safely",
+            }
+
+        if model not in self.allowed_session_models:
+            return {
+                "success": False,
+                "error": "Model is not exposed by the current OpenCode provider catalog",
+                "allowed_models": sorted(self.allowed_session_models),
+            }
         self.session_models[session_id] = model
         logger.info("set_session_model", session_id=session_id, model=model)
         return {"success": True, "session_id": session_id, "model": model}

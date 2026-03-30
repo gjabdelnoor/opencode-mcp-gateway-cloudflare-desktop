@@ -83,6 +83,24 @@ def mock_opencode_client():
     client.update_session = AsyncMock(return_value={"success": True})
     client.list_messages = AsyncMock(return_value=[])
     client.get_session_status = AsyncMock(return_value={})
+    client.get_provider_catalog = AsyncMock(
+        return_value={
+            "providers": [
+                {
+                    "id": "openai",
+                    "models": {
+                        "gpt-5.4-mini": {"id": "gpt-5.4-mini", "status": "active"}
+                    },
+                },
+                {
+                    "id": "minimax-coding-plan",
+                    "models": {
+                        "MiniMax-M2.7": {"id": "MiniMax-M2.7", "status": "active"}
+                    },
+                },
+            ]
+        }
+    )
     return client
 
 

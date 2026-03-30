@@ -73,13 +73,14 @@ class OpenCodeClient:
         permissions: Optional[list] = None,
     ) -> dict:
         payload: dict[str, Any] = {}
+        params: dict[str, Any] = {}
         if title:
             payload["title"] = title
         if directory:
-            payload["directory"] = directory
+            params["directory"] = directory
         if permissions:
             payload["permission"] = permissions
-        resp = await self.client.post("/session", json=payload)
+        resp = await self.client.post("/session", params=params, json=payload)
         resp.raise_for_status()
         return resp.json()
 
@@ -101,6 +102,12 @@ class OpenCodeClient:
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"directory": directory} if directory else {}
         resp = await self.client.get("/session/status", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+
+    async def get_provider_catalog(self) -> dict[str, Any]:
+        resp = await self.client.get("/config/providers")
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, dict) else {}

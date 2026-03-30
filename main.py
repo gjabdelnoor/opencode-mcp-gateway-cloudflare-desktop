@@ -150,6 +150,19 @@ def create_fastmcp() -> FastMCP:
         return await session_mgr.list_sessions(cursor=cursor, limit=limit)
 
     @mcp.tool()
+    async def list_recent_sessions(limit: int = 10, days: int = 7) -> dict:
+        """List recently active sessions from the last N days ordered by last activity.
+
+        This is intended as the fast path for agents that need to find relevant recent
+        sessions without paging through the full history.
+
+        Args:
+            limit: Maximum sessions to return (default 10, max 50)
+            days: Only include sessions active within the last N days (default 7)
+        """
+        return await session_mgr.list_recent_sessions(limit=limit, days=days)
+
+    @mcp.tool()
     async def session_create(
         initial_message: str,
         title: Optional[str] = None,
@@ -383,9 +396,9 @@ def create_fastmcp() -> FastMCP:
         return session_mgr.set_active_session(session_id)
 
     @mcp.tool()
-    def switch_model(session_id: str, model: str) -> dict:
+    async def switch_model(session_id: str, model: str) -> dict:
         """Set the model for a session (e.g., 'openai/gpt-4o', 'anthropic/claude-3-5-sonnet')."""
-        return session_mgr.set_session_model(session_id, model)
+        return await session_mgr.set_session_model(session_id, model)
 
     @mcp.tool()
     async def switch_mode_and_send(session_id: str, mode: str, message: str) -> dict:

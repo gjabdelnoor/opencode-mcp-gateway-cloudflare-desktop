@@ -92,7 +92,7 @@ class TestOpenCodeClient:
         call_args = client.client.post.call_args
         assert call_args[0][0] == "/session"
         assert call_args[1]["json"]["title"] == "New Session"
-        assert call_args[1]["json"]["directory"] == "/tmp"
+        assert call_args[1]["params"]["directory"] == "/tmp"
 
     @pytest.mark.asyncio
     async def test_create_session_with_defaults(self, client):
@@ -107,6 +107,7 @@ class TestOpenCodeClient:
         client.client.post.assert_called_once()
         call_args = client.client.post.call_args
         assert call_args[1]["json"] == {}
+        assert call_args[1]["params"] == {}
 
     @pytest.mark.asyncio
     async def test_delete_session(self, client):
@@ -148,6 +149,19 @@ class TestOpenCodeClient:
 
         assert result == {"s1": {"type": "retry"}}
         client.client.get.assert_called_once_with("/session/status", params={})
+
+    @pytest.mark.asyncio
+    async def test_get_provider_catalog(self, client):
+        """Test reading provider catalog."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value={"providers": [{"id": "openai"}]})
+        client.client.get = AsyncMock(return_value=mock_response)
+
+        result = await client.get_provider_catalog()
+
+        assert result == {"providers": [{"id": "openai"}]}
+        client.client.get.assert_called_once_with("/config/providers")
 
     @pytest.mark.asyncio
     async def test_send_message(self, client):

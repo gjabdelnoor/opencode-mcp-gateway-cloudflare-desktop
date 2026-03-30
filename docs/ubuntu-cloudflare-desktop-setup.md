@@ -40,9 +40,18 @@ The biggest interoperability fixes that made Claude work reliably were:
 
 - Ubuntu machine
 - Free Cloudflare account
-- A domain you already own
-- The domain delegated to Cloudflare nameservers
+- Either:
+  - a domain you already own and delegate to Cloudflare, or
+  - the free temporary `trycloudflare.com` route
 - LLM provider access for OpenCode
+
+Recommended path:
+
+- your own domain on Cloudflare DNS
+
+Experimental path:
+
+- free `trycloudflare.com`
 
 ## Before You Start
 
@@ -94,8 +103,8 @@ If you want to use a different port, update `OPENCODE_PORT` in the gateway `.env
 ## 3. Clone This Repository
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/YOUR_REPO_NAME.git
-cd YOUR_REPO_NAME
+git clone https://github.com/gjabdelnoor/opencode-mcp-gateway-cloudflare-desktop.git
+cd opencode-mcp-gateway-cloudflare-desktop
 ```
 
 ## 4. Install Gateway Dependencies
@@ -130,6 +139,7 @@ MCP_AUTH_TOKEN=replace-with-a-long-random-secret
 MCP_CLIENT_ID=opencode-mcp-gateway
 MCP_ALLOWED_CLIENT_IDS=opencode-mcp-gateway
 PUBLIC_BASE_URL=https://mcp.example.com
+DEFAULT_WORKSPACE_DIR="/home/YOUR_USER/AI Projects"
 OPENCODE_HOST=127.0.0.1
 OPENCODE_PORT=9999
 GATEWAY_PORT=3001
@@ -139,6 +149,11 @@ DEFAULT_BUILDING_MODEL=openai/gpt-5.4-mini
 ```
 
 Those last two model overrides are optional, but strongly recommended if your OpenCode default planning or building models are not actually usable with your account. In one real-world setup, OpenCode kept retrying an unsupported default model and the gateway appeared to "stall" until these overrides were set.
+
+This fork also explicitly blocks two MiniMax models that were manually confirmed not to work reliably in this environment:
+
+- `minimax-coding-plan/MiniMax-M2.5-highspeed`
+- `minimax-coding-plan/MiniMax-M2.7-highspeed`
 
 ## 6. Start the Gateway Locally
 
@@ -157,7 +172,11 @@ curl http://127.0.0.1:3001/.well-known/oauth-authorization-server
 
 The returned JSON should advertise your `PUBLIC_BASE_URL`, not `localhost`.
 
-## 7. Add Your Domain to Cloudflare
+## 7. Choose A Public Endpoint Strategy
+
+There are two public endpoint paths.
+
+### Option A: Purchased domain on Cloudflare DNS
 
 If your domain is not already using Cloudflare DNS:
 
@@ -166,6 +185,17 @@ If your domain is not already using Cloudflare DNS:
 3. Wait for the zone to become active
 
 You do not need a paid Cloudflare plan for this setup.
+
+### Option B: Free `trycloudflare.com`
+
+This is the free path for experimentation.
+
+Tradeoffs:
+
+- the public hostname is temporary
+- reconnects can change the hostname
+- OAuth clients may need to be recreated after reconnects
+- not recommended for long-term stable connector use
 
 ## 8. Install cloudflared on Ubuntu
 
@@ -191,7 +221,11 @@ cloudflared tunnel login
 
 This opens a browser window. Pick the Cloudflare account and zone that owns your domain.
 
+If you are only using `trycloudflare.com`, you can skip the named tunnel steps below.
+
 ## 10. Create the Tunnel
+
+### Purchased domain path
 
 ```bash
 cloudflared tunnel create opencode-mcp-gateway
@@ -201,6 +235,8 @@ This prints a tunnel ID and stores credentials under `~/.cloudflared/`.
 
 ## 11. Create the Public DNS Record
 
+### Purchased domain path
+
 Pick a hostname such as `mcp.example.com` and route it to the tunnel:
 
 ```bash
@@ -208,6 +244,8 @@ cloudflared tunnel route dns opencode-mcp-gateway mcp.example.com
 ```
 
 ## 12. Create the Tunnel Config
+
+### Purchased domain path
 
 Create `~/.cloudflared/config.yml`:
 
@@ -231,9 +269,27 @@ Update:
 
 ## 13. Start the Tunnel
 
+### Purchased domain path
+
 ```bash
 cloudflared tunnel run opencode-mcp-gateway
 ```
+
+### Free `trycloudflare.com` path
+
+If you are using the free path, run:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:3001
+```
+
+Then copy the generated `https://...trycloudflare.com` hostname and set:
+
+```bash
+PUBLIC_BASE_URL=https://your-generated-host.trycloudflare.com
+```
+
+Restart `python main.py` after changing `.env`.
 
 Leave it running.
 
@@ -252,6 +308,8 @@ curl https://mcp.example.com/.well-known/oauth-authorization-server
 curl https://mcp.example.com/.well-known/oauth-authorization-server/mcp
 curl https://mcp.example.com/.well-known/oauth-protected-resource
 ```
+
+If you are using the free path, replace `mcp.example.com` with your generated `trycloudflare.com` hostname in every command above.
 
 The main checks are:
 
@@ -296,6 +354,8 @@ If you are configuring Claude manually, use:
 
 Claude can discover the rest from the MCP server.
 
+If you run multiple public gateways, give each one its own `MCP_CLIENT_ID` so connector credentials do not collide across endpoints.
+
 For Claude or other OAuth clients that send a different `client_id`, either:
 
 - configure the client to use `opencode-mcp-gateway`, or
@@ -316,6 +376,12 @@ This repo includes:
 - `deploy/systemd/cloudflared-opencode-mcp-gateway.service`
 
 If you want the machine to bring the gateway back automatically after reboot, use the systemd unit files. If you only need it while the desktop is in use, running the three commands manually is enough.
+
+## Operational Notes
+
+- New sessions default to `DEFAULT_WORKSPACE_DIR` if you do not pass an explicit directory.
+- New PTYs also default there.
+- The gateway now includes `list_recent_sessions(limit=10, days=7)` to help agents find recently active sessions quickly.
 
 ## Running Multiple Gateways For Concurrent Agents
 
@@ -489,6 +555,12 @@ DEFAULT_BUILDING_MODEL=openai/gpt-5.4-mini
 ```
 
 You can also explicitly switch models per session using the gateway tools.
+
+### `switch_model` rejects a model you expected to work
+
+This fork validates model switches against the live OpenCode provider catalog.
+
+It also rejects the two explicitly blocked MiniMax highspeed variants listed above.
 
 ### `session_create` in planning mode replies with a refusal to run commands
 

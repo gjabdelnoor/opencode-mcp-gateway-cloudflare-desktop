@@ -2,8 +2,11 @@
 
 import asyncio
 import time
+from datetime import datetime, timedelta
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
+
+from session_manager import SessionInfo
 
 
 class TestSessionManager:
@@ -70,6 +73,27 @@ class TestSessionManager:
         )
 
     @pytest.mark.asyncio
+    async def test_create_session_uses_default_workspace_dir(
+        self, mock_opencode_client
+    ):
+        """Test new sessions default to DEFAULT_WORKSPACE_DIR when none is passed."""
+        with patch.dict("os.environ", {"DEFAULT_WORKSPACE_DIR": "/workspace/root"}):
+            from session_manager import SessionManager
+
+            manager = SessionManager(mock_opencode_client)
+            mock_opencode_client.list_messages = AsyncMock(
+                return_value=self._completed_assistant_message("created")
+            )
+
+            await manager.create_session(initial_message="Hello")
+
+            mock_opencode_client.create_session.assert_called_once_with(
+                title=None,
+                directory="/workspace/root",
+                permissions=None,
+            )
+
+    @pytest.mark.asyncio
     async def test_delete_session(self, session_manager, mock_opencode_client):
         """Test deleting a session."""
         mock_opencode_client.list_messages = AsyncMock(
@@ -131,15 +155,72 @@ class TestSessionManager:
     @pytest.mark.asyncio
     async def test_set_session_model(self, session_manager, mock_opencode_client):
         """Test setting session model."""
-        result = session_manager.set_session_model(
-            "test-session-1", "anthropic/claude-3-5-sonnet"
+        result = await session_manager.set_session_model(
+            "test-session-1", "minimax-coding-plan/MiniMax-M2.7"
         )
 
         assert result["success"] is True
         assert (
             session_manager.get_session_model("test-session-1")
-            == "anthropic/claude-3-5-sonnet"
+            == "minimax-coding-plan/MiniMax-M2.7"
         )
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_rejects_unknown_catalog_model(
+        self, session_manager, mock_opencode_client
+    ):
+        """Test setting a model outside the live provider catalog is rejected."""
+        result = await session_manager.set_session_model(
+            "test-session-1", "openai/codex-5.3-x-high"
+        )
+
+        assert result["success"] is False
+        assert "provider catalog" in result["error"]
+        assert "openai/gpt-5.4-mini" in result["allowed_models"]
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_rejects_provider_only_value(
+        self, session_manager, mock_opencode_client
+    ):
+        """Test setting a model without provider/model format is rejected."""
+        result = await session_manager.set_session_model("test-session-1", "openai")
+
+        assert result["success"] is False
+        assert "provider/model format" in result["error"]
+        assert "openai" in result["available_providers"]
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_rejects_blocked_highspeed_model(
+        self, session_manager, mock_opencode_client
+    ):
+        """Test known-bad highspeed MiniMax models are rejected."""
+        mock_opencode_client.get_provider_catalog = AsyncMock(
+            return_value={
+                "providers": [
+                    {
+                        "id": "minimax-coding-plan",
+                        "models": {
+                            "MiniMax-M2.5-highspeed": {
+                                "id": "MiniMax-M2.5-highspeed",
+                                "status": "active",
+                            },
+                            "MiniMax-M2.7-highspeed": {
+                                "id": "MiniMax-M2.7-highspeed",
+                                "status": "active",
+                            },
+                        },
+                    }
+                ]
+            }
+        )
+
+        result = await session_manager.set_session_model(
+            "test-session-1", "minimax-coding-plan/MiniMax-M2.7-highspeed"
+        )
+
+        assert result["success"] is False
+        assert "known not to work reliably" in result["error"]
+        assert "minimax-coding-plan/MiniMax-M2.7-highspeed" in result["blocked_models"]
 
     @pytest.mark.asyncio
     async def test_get_session_model_not_set(
@@ -214,6 +295,142 @@ class TestSessionManager:
         assert len(result["sessions"]) == 1
         assert "recent_messages" in result["sessions"][0]
         assert len(result["sessions"][0]["recent_messages"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_list_recent_sessions_filters_and_orders_by_activity(
+        self, session_manager, mock_opencode_client
+    ):
+        """Test recent sessions are cutoff-filtered and ordered by last activity."""
+        from opencode_client import Session
+
+        now_ms = int(time.time() * 1000)
+        one_hour_ms = 60 * 60 * 1000
+        one_day_ms = 24 * one_hour_ms
+
+        mock_opencode_client.list_sessions = AsyncMock(
+            return_value=[
+                Session(
+                    id="recent-a",
+                    title="Recent A",
+                    slug="recent-a",
+                    created=now_ms - one_day_ms,
+                    updated=now_ms - one_hour_ms,
+                ),
+                Session(
+                    id="recent-b",
+                    title="Recent B",
+                    slug="recent-b",
+                    created=now_ms - 2 * one_day_ms,
+                    updated=now_ms - 2 * one_hour_ms,
+                ),
+                Session(
+                    id="old-c",
+                    title="Old C",
+                    slug="old-c",
+                    created=now_ms - 10 * one_day_ms,
+                    updated=now_ms - 10 * one_day_ms,
+                ),
+            ]
+        )
+
+        async def get_session_side_effect(session_id):
+            mapping = {
+                "recent-a": {
+                    "id": "recent-a",
+                    "title": "Recent A",
+                    "directory": "/tmp/a",
+                    "time": {
+                        "created": now_ms - one_day_ms,
+                        "updated": now_ms - one_hour_ms,
+                    },
+                },
+                "recent-b": {
+                    "id": "recent-b",
+                    "title": "Recent B",
+                    "directory": "/tmp/b",
+                    "time": {
+                        "created": now_ms - 2 * one_day_ms,
+                        "updated": now_ms - 2 * one_hour_ms,
+                    },
+                },
+                "old-c": {
+                    "id": "old-c",
+                    "title": "Old C",
+                    "directory": "/tmp/c",
+                    "time": {
+                        "created": now_ms - 10 * one_day_ms,
+                        "updated": now_ms - 10 * one_day_ms,
+                    },
+                },
+            }
+            return mapping[session_id]
+
+        mock_opencode_client.get_session = AsyncMock(
+            side_effect=get_session_side_effect
+        )
+        mock_opencode_client.list_messages = AsyncMock(return_value=[])
+
+        result = await session_manager.list_recent_sessions(limit=10, days=7)
+
+        assert result["total_recent"] == 2
+        assert [session["id"] for session in result["sessions"]] == [
+            "recent-a",
+            "recent-b",
+        ]
+        assert all(
+            session["last_activity"] >= result["cutoff_timestamp"]
+            for session in result["sessions"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_recent_sessions_uses_in_memory_last_used(
+        self, session_manager, mock_opencode_client
+    ):
+        """Test recent sessions prefer gateway last-used timestamps over stale backend updates."""
+        from opencode_client import Session
+
+        now_ms = int(time.time() * 1000)
+        one_day_ms = 24 * 60 * 60 * 1000
+
+        mock_opencode_client.list_sessions = AsyncMock(
+            return_value=[
+                Session(
+                    id="stale-backend",
+                    title="Stale Backend",
+                    slug="stale-backend",
+                    created=now_ms - 20 * one_day_ms,
+                    updated=now_ms - 20 * one_day_ms,
+                )
+            ]
+        )
+        mock_opencode_client.get_session = AsyncMock(
+            return_value={
+                "id": "stale-backend",
+                "title": "Stale Backend",
+                "directory": "/tmp/stale",
+                "time": {
+                    "created": now_ms - 20 * one_day_ms,
+                    "updated": now_ms - 20 * one_day_ms,
+                },
+            }
+        )
+        mock_opencode_client.list_messages = AsyncMock(return_value=[])
+
+        info = SessionInfo(
+            session_id="stale-backend",
+            title="Stale Backend",
+            owner="claude",
+            created_at=datetime.now() - timedelta(days=20),
+        )
+        info.last_used = datetime.now()
+        session_manager.sessions["stale-backend"] = info
+        session_manager.claude_session_ids.add("stale-backend")
+
+        result = await session_manager.list_recent_sessions(limit=10, days=7)
+
+        assert result["total_recent"] == 1
+        assert result["sessions"][0]["id"] == "stale-backend"
+        assert result["sessions"][0]["owner"] == "claude"
 
     @pytest.mark.asyncio
     async def test_read_session_logs_summary(
@@ -423,6 +640,27 @@ class TestSessionManager:
         mock_opencode_client.create_session.assert_called_once_with(
             title="Raw Bash Session"
         )
+
+    @pytest.mark.asyncio
+    async def test_ensure_session_uses_default_workspace_dir(
+        self, mock_opencode_client
+    ):
+        """Test fallback shell session uses DEFAULT_WORKSPACE_DIR."""
+        with patch.dict("os.environ", {"DEFAULT_WORKSPACE_DIR": "/workspace/root"}):
+            from session_manager import SessionManager
+
+            manager = SessionManager(mock_opencode_client)
+            mock_opencode_client.create_session = AsyncMock(
+                return_value={"id": "shell-session"}
+            )
+
+            result = await manager.ensure_session()
+
+            assert result == "shell-session"
+            mock_opencode_client.create_session.assert_called_once_with(
+                title="Raw Bash Session",
+                directory="/workspace/root",
+            )
 
     @pytest.mark.asyncio
     async def test_run_shell_command(self, session_manager, mock_opencode_client):
