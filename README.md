@@ -13,6 +13,24 @@ If you want the full from-scratch guide, start here:
 
 - `docs/ubuntu-cloudflare-desktop-setup.md`
 
+## Tested Status
+
+This setup has been tested in the following shape:
+
+- Ubuntu desktop origin
+- OpenCode running locally on `127.0.0.1:9999`
+- Python gateway running locally on `127.0.0.1:3001`
+- Cloudflare Tunnel publishing a public HTTPS hostname
+- ChatGPT OAuth flow working against the public hostname
+- Claude remote MCP OAuth flow working after the protected resource and `WWW-Authenticate` fixes in this fork
+
+The main Claude compatibility fixes in this repo are:
+
+- `WWW-Authenticate` on `401` responses from `/mcp`
+- protected resource metadata advertising the actual MCP resource URL
+- stricter auth-code validation for `redirect_uri` and `resource`
+- tolerance for clients that send either the MCP endpoint resource or the root origin resource
+
 OpenCode docs you should read first:
 
 - Intro: `https://opencode.ai/docs/`
@@ -209,6 +227,18 @@ Register these with your clients:
 - Claude: `https://mcp.example.com/.well-known/oauth-authorization-server`
 - ChatGPT: `https://mcp.example.com/.well-known/oauth-authorization-server/mcp`
 
+### Claude Notes
+
+For Claude custom connectors:
+
+- MCP server URL: `https://mcp.example.com/mcp`
+- OAuth discovery is derived from the MCP server automatically
+- If you are filling advanced settings manually, use:
+  - OAuth Client ID: `opencode-mcp-gateway`
+  - OAuth Client Secret: your `MCP_AUTH_TOKEN`
+
+This repo does not implement dynamic client registration. Manual client configuration is the expected path.
+
 ## Auto-Restart (systemd)
 
 For VPS reliability, run the gateway as a systemd service with automatic restart.
@@ -248,6 +278,27 @@ You can expose a second gateway on the same domain using a path prefix, for exam
 - Run the second gateway with `PUBLIC_BASE_URL=https://mcp.example.com/desktop`
 - Route `https://mcp.example.com/desktop/*` to that second gateway, stripping the `/desktop` prefix at the reverse proxy
 - Register ChatGPT connector URL as `https://mcp.example.com/desktop/mcp`
+
+## Multiple Concurrent Agents
+
+If you want multiple Claude or ChatGPT chats to manage different agents concurrently, run multiple gateway instances instead of sharing one gateway process.
+
+Recommended pattern:
+
+- `mcp1.example.com -> localhost:3001`
+- `mcp2.example.com -> localhost:3002`
+- `mcp3.example.com -> localhost:3003`
+- `mcp4.example.com -> localhost:3004`
+- `mcp5.example.com -> localhost:3005`
+- `mcp6.example.com -> localhost:3006`
+
+Each instance should have:
+
+- its own `PUBLIC_BASE_URL`
+- its own `GATEWAY_PORT`
+- its own `MCP_AUTH_TOKEN`
+
+That gives you better isolation between chatbot sessions and avoids one gateway's in-memory session state becoming shared across all active bots.
 
 ## Security Note
 

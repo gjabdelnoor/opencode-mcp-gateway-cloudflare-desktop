@@ -10,6 +10,25 @@ Claude / ChatGPT -> Cloudflare -> cloudflared tunnel -> this gateway -> OpenCode
 
 This is a desktop-first setup. You do not need a VPS. Your MCP server is available only while your Ubuntu machine is powered on and running both OpenCode and the gateway.
 
+## Tested Scope
+
+This guide is based on a setup that has been exercised against real public Cloudflare-hosted endpoints.
+
+Validated pieces:
+
+- local OpenCode origin on Ubuntu
+- local Python gateway behind Cloudflare Tunnel
+- public OAuth discovery endpoints
+- ChatGPT OAuth flow against the public endpoint
+- Claude remote MCP OAuth flow against the public endpoint
+
+The biggest interoperability fixes that made Claude work reliably were:
+
+- adding `WWW-Authenticate` with `resource_metadata` on unauthorized `/mcp` responses
+- advertising the actual MCP resource URL in protected resource metadata
+- validating `redirect_uri` and `resource` during auth-code exchange
+- tolerating either `https://host` or `https://host/mcp` style resource values when clients vary
+
 ## What You Need
 
 - Ubuntu machine
@@ -228,6 +247,15 @@ The main checks are:
 - `issuer` is `https://mcp.example.com`
 - `authorization_endpoint` is `https://mcp.example.com/authorize`
 - `token_endpoint` is `https://mcp.example.com/oauth/token`
+- protected resource metadata returns `resource: https://mcp.example.com/mcp`
+- `GET https://mcp.example.com/mcp` without a bearer token returns `401` and includes a `WWW-Authenticate` header with `resource_metadata`
+
+Example checks:
+
+```bash
+curl -i https://mcp.example.com/.well-known/oauth-protected-resource
+curl -D - -o /dev/null https://mcp.example.com/mcp
+```
 
 ## 15. Connect ChatGPT or Claude
 
@@ -249,6 +277,14 @@ If you are configuring ChatGPT manually, the usual values are:
 - Token auth method: `client_secret_post`
 - Scope: `mcp`
 
+If you are configuring Claude manually, use:
+
+- MCP Server URL: `https://mcp.example.com/mcp`
+- OAuth Client ID: `opencode-mcp-gateway`
+- OAuth Client Secret: the value of `MCP_AUTH_TOKEN`
+
+Claude can discover the rest from the MCP server.
+
 For Claude or other OAuth clients that send a different `client_id`, either:
 
 - configure the client to use `opencode-mcp-gateway`, or
@@ -269,6 +305,53 @@ This repo includes:
 - `deploy/systemd/cloudflared-opencode-mcp-gateway.service`
 
 If you want the machine to bring the gateway back automatically after reboot, use the systemd unit files. If you only need it while the desktop is in use, running the three commands manually is enough.
+
+## Running Multiple Gateways For Concurrent Agents
+
+If you want multiple chatbot conversations to drive separate OpenCode agent sessions concurrently, the safest approach is to run multiple gateway processes.
+
+Example layout:
+
+```text
+mcp1.example.com -> localhost:3001
+mcp2.example.com -> localhost:3002
+mcp3.example.com -> localhost:3003
+mcp4.example.com -> localhost:3004
+mcp5.example.com -> localhost:3005
+mcp6.example.com -> localhost:3006
+```
+
+Each instance should have its own environment file with at least:
+
+- unique `PUBLIC_BASE_URL`
+- unique `GATEWAY_PORT`
+- unique `MCP_AUTH_TOKEN`
+
+Example for a second instance:
+
+```bash
+MCP_AUTH_TOKEN=replace-with-another-secret
+MCP_CLIENT_ID=opencode-mcp-gateway
+MCP_ALLOWED_CLIENT_IDS=opencode-mcp-gateway
+PUBLIC_BASE_URL=https://mcp2.example.com
+OPENCODE_HOST=127.0.0.1
+OPENCODE_PORT=9999
+GATEWAY_PORT=3002
+ENABLE_RAW_BASH=true
+```
+
+Then add a matching Cloudflare Tunnel ingress rule:
+
+```yaml
+- hostname: mcp2.example.com
+  service: http://127.0.0.1:3002
+```
+
+Why this is better than one shared gateway:
+
+- each gateway keeps its own in-memory active session state
+- OAuth secrets are isolated per connector
+- one bot is less likely to interfere with another bot's session selection
 
 ## Untested All-Free Alternative
 
@@ -366,6 +449,18 @@ Useful log messages to look for:
 - `oauth_client_id_mismatch`
 - `oauth_invalid_client_for_auth_code`
 
+### Claude says authorization failed even though the login redirect worked
+
+Check these first:
+
+- `GET /.well-known/oauth-protected-resource` returns `resource: https://mcp.example.com/mcp`
+- `GET /mcp` without auth returns `401` with a `WWW-Authenticate` header containing `resource_metadata`
+- the MCP server URL entered in Claude is `https://mcp.example.com/mcp`
+- the OAuth client secret entered in Claude exactly matches `MCP_AUTH_TOKEN`
+- `PUBLIC_BASE_URL` is the public HTTPS hostname, not `localhost`
+
+If any of those are wrong, Claude may complete the browser redirect but still fail the connector handshake.
+
 ### Multiple bots are stepping on each other
 
 Run separate gateway instances on separate hostnames and ports, for example:
@@ -383,6 +478,8 @@ Compared to the upstream repo, this setup-focused variant adds:
 - desktop-local tunnel runner script
 - configurable OAuth metadata tests using `PUBLIC_BASE_URL`
 - `fastmcp` in `requirements.txt` because the code imports it at runtime
+- protected resource and `WWW-Authenticate` fixes for Claude-compatible remote MCP OAuth
+- optional `MCP_ALLOWED_CLIENT_IDS` for environments with multiple expected OAuth client IDs
 
 ## Security Notes
 

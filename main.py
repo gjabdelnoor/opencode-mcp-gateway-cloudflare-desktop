@@ -9,6 +9,7 @@ import asyncio
 import secrets
 import hashlib
 import base64
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Optional, cast
 
@@ -90,6 +91,33 @@ def _resolve_resource_base(request: Request) -> str:
     if base_url.endswith("/mcp"):
         return base_url[:-4]
     return base_url
+
+
+def _normalize_resource_uri(value: str) -> str:
+    if not value:
+        return ""
+
+    parts = urlsplit(value)
+    if not parts.scheme or not parts.netloc:
+        return value.rstrip("/")
+
+    path = parts.path.rstrip("/")
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")
+    )
+
+
+def _resolve_mcp_resource(request: Request) -> str:
+    resource_base = _resolve_resource_base(request)
+    if resource_base.endswith("/mcp"):
+        return resource_base
+    return f"{resource_base}/mcp"
+
+
+def _resolve_resource_metadata_url(request: Request) -> str:
+    resource_base = _resolve_resource_base(request)
+    suffix = "/mcp" if request.url.path.startswith("/mcp") else ""
+    return f"{resource_base}/.well-known/oauth-protected-resource{suffix}"
 
 
 def _is_allowed_client_id(client_id: str) -> bool:
@@ -498,11 +526,13 @@ async def handle_oauth_authorize(request: Request):
     code_challenge = params.get("code_challenge", "")
     code_challenge_method = params.get("code_challenge_method", "S256")
     scope = params.get("scope", "mcp")
+    resource = params.get("resource", "")
 
     logger.info(
         "oauth_authorize_request",
         client_id=client_id,
         redirect_uri=redirect_uri,
+        resource=resource,
         pkce_enabled=bool(code_challenge),
         code_challenge_method=code_challenge_method,
     )
@@ -518,6 +548,8 @@ async def handle_oauth_authorize(request: Request):
     code = secrets.token_hex(32)
     auth_codes[code] = {
         "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "resource": _normalize_resource_uri(resource),
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "scope": scope,
@@ -544,12 +576,16 @@ async def handle_oauth_authorize_post(request: Request) -> RedirectResponse:
         return RedirectResponse(f"{redirect_uri}?{params}", status_code=302)
 
     code = form.get("code", "")
+    client_id = str(form.get("client_id", MCP_CLIENT_ID))
     code_challenge = form.get("code_challenge", "")
     code_challenge_method = form.get("code_challenge_method", "S256")
     scope = form.get("scope", "mcp")
+    resource = str(form.get("resource", ""))
 
     auth_codes[code] = {
-        "client_id": str(form.get("client_id", MCP_CLIENT_ID)),
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "resource": _normalize_resource_uri(resource),
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "scope": scope,
@@ -614,6 +650,8 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
         grant_type = str(body.get("grant_type", ""))
         code = str(body.get("code", ""))
         code_verifier = str(body.get("code_verifier", ""))
+        redirect_uri = str(body.get("redirect_uri", ""))
+        resource = _normalize_resource_uri(str(body.get("resource", "")))
         client_id, client_secret = extract_client_credentials(
             body, dict(request.headers)
         )
@@ -637,6 +675,8 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
                 return JSONResponse({"error": "code_expired"}, status_code=400)
 
             auth_client_id = str(auth_info.get("client_id", ""))
+            auth_redirect_uri = str(auth_info.get("redirect_uri", ""))
+            auth_resource = _normalize_resource_uri(str(auth_info.get("resource", "")))
             if (
                 client_id
                 and auth_client_id
@@ -649,6 +689,43 @@ async def handle_oauth_token(request: Request) -> JSONResponse:
                     code_prefix=code[:8],
                 )
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+            if redirect_uri and auth_redirect_uri and redirect_uri != auth_redirect_uri:
+                logger.warning(
+                    "oauth_redirect_uri_mismatch",
+                    client_id=client_id,
+                    redirect_uri=redirect_uri,
+                    expected_redirect_uri=auth_redirect_uri,
+                    code_prefix=code[:8],
+                )
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            expected_resource = _normalize_resource_uri(_resolve_mcp_resource(request))
+            legacy_resource = _normalize_resource_uri(_resolve_resource_base(request))
+            allowed_resources = {expected_resource, legacy_resource}
+
+            if resource and resource not in allowed_resources:
+                logger.warning(
+                    "oauth_invalid_target_resource",
+                    client_id=client_id,
+                    resource=resource,
+                    expected_resource=expected_resource,
+                    code_prefix=code[:8],
+                )
+                return JSONResponse({"error": "invalid_target"}, status_code=400)
+
+            if auth_resource and resource and resource != auth_resource:
+                if {auth_resource, resource}.issubset(allowed_resources):
+                    auth_resource = resource
+                else:
+                    logger.warning(
+                        "oauth_resource_mismatch",
+                        client_id=client_id,
+                        resource=resource,
+                        expected_resource=auth_resource,
+                        code_prefix=code[:8],
+                    )
+                    return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             code_challenge = str(auth_info.get("code_challenge", ""))
             if code_challenge:
@@ -753,6 +830,7 @@ class BearerAuthMiddleware:
             return
 
         path = scope.get("path", "")
+        request = Request(scope, receive=receive)
         oauth_paths = [
             "/authorize",
             "/oauth/",
@@ -781,12 +859,21 @@ class BearerAuthMiddleware:
                     },
                     status_code=401,
                 )
+                response.headers["WWW-Authenticate"] = (
+                    f'Bearer resource_metadata="{_resolve_resource_metadata_url(request)}", '
+                    'error="invalid_token", '
+                    'error_description="Missing or invalid Authorization header"'
+                )
                 await response(scope, receive, send)
                 return
 
             token = auth_header[7:]
             if not secrets.compare_digest(token, AUTH_TOKEN):
                 response = JSONResponse({"error": "invalid_token"}, status_code=401)
+                response.headers["WWW-Authenticate"] = (
+                    f'Bearer resource_metadata="{_resolve_resource_metadata_url(request)}", '
+                    'error="invalid_token"'
+                )
                 await response(scope, receive, send)
                 return
 
@@ -816,11 +903,12 @@ async def handle_oauth_discovery(request: Request) -> JSONResponse:
 
 async def handle_protected_resource(request: Request) -> JSONResponse:
     """Protected resource metadata endpoint (RFC 9728)."""
-    resource_base = _resolve_resource_base(request)
+    resource = _resolve_mcp_resource(request)
+    authorization_server = _resolve_resource_base(request)
     return JSONResponse(
         {
-            "resource": resource_base,
-            "authorization_servers": [resource_base],
+            "resource": resource,
+            "authorization_servers": [authorization_server],
             "scopes_supported": ["mcp", "openid", "profile", "email"],
             "bearer_methods_supported": ["header"],
         }

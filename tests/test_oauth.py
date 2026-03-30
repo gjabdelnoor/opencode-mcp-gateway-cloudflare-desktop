@@ -5,6 +5,7 @@ from starlette.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import asyncio
 import importlib
+import time
 
 
 TEST_PUBLIC_BASE_URL = "https://mcp.example.com"
@@ -23,53 +24,59 @@ class TestOAuthEndpoints:
                 "PUBLIC_BASE_URL": TEST_PUBLIC_BASE_URL,
             },
         ):
-            from main import create_fastmcp, main as main_module
-            from starlette.routing import Route
+            import main
 
-            mcp = create_fastmcp()
+            importlib.reload(main)
+
+            mcp = main.create_fastmcp()
             mcp_app = mcp.http_app(path="/mcp")
+            mcp_app.add_middleware(main.BearerAuthMiddleware)
 
-            from main import (
-                handle_health,
-                handle_oauth_authorize,
-                handle_oauth_authorize_post,
-                handle_oauth_token,
-                handle_oauth_discovery,
-                handle_protected_resource,
-            )
-
-            mcp_app.add_route("/health", handle_health, methods=["GET"])
+            mcp_app.add_route("/health", main.handle_health, methods=["GET"])
             mcp_app.add_route(
                 "/.well-known/oauth-authorization-server",
-                handle_oauth_discovery,
+                main.handle_oauth_discovery,
                 methods=["GET"],
             )
             mcp_app.add_route(
                 "/.well-known/oauth-authorization-server/mcp",
-                handle_oauth_discovery,
+                main.handle_oauth_discovery,
                 methods=["GET"],
             )
             mcp_app.add_route(
                 "/.well-known/oauth-protected-resource",
-                handle_protected_resource,
+                main.handle_protected_resource,
                 methods=["GET"],
             )
-            mcp_app.add_route("/authorize", handle_oauth_authorize, methods=["GET"])
             mcp_app.add_route(
-                "/oauth/authorize", handle_oauth_authorize, methods=["GET"]
+                "/.well-known/oauth-protected-resource/mcp",
+                main.handle_protected_resource,
+                methods=["GET"],
             )
             mcp_app.add_route(
-                "/oauth/authorize", handle_oauth_authorize_post, methods=["POST"]
-            )
-            mcp_app.add_route("/oauth/token", handle_oauth_token, methods=["POST"])
-            mcp_app.add_route("/mcp/authorize", handle_oauth_authorize, methods=["GET"])
-            mcp_app.add_route(
-                "/mcp/oauth/authorize", handle_oauth_authorize, methods=["GET"]
+                "/authorize", main.handle_oauth_authorize, methods=["GET"]
             )
             mcp_app.add_route(
-                "/mcp/oauth/authorize", handle_oauth_authorize_post, methods=["POST"]
+                "/oauth/authorize", main.handle_oauth_authorize, methods=["GET"]
             )
-            mcp_app.add_route("/mcp/oauth/token", handle_oauth_token, methods=["POST"])
+            mcp_app.add_route(
+                "/oauth/authorize", main.handle_oauth_authorize_post, methods=["POST"]
+            )
+            mcp_app.add_route("/oauth/token", main.handle_oauth_token, methods=["POST"])
+            mcp_app.add_route(
+                "/mcp/authorize", main.handle_oauth_authorize, methods=["GET"]
+            )
+            mcp_app.add_route(
+                "/mcp/oauth/authorize", main.handle_oauth_authorize, methods=["GET"]
+            )
+            mcp_app.add_route(
+                "/mcp/oauth/authorize",
+                main.handle_oauth_authorize_post,
+                methods=["POST"],
+            )
+            mcp_app.add_route(
+                "/mcp/oauth/token", main.handle_oauth_token, methods=["POST"]
+            )
 
             return TestClient(mcp_app, raise_server_exceptions=False)
 
@@ -90,6 +97,7 @@ class TestOAuthEndpoints:
 
             mcp = main.create_fastmcp()
             mcp_app = mcp.http_app(path="/mcp")
+            mcp_app.add_middleware(main.BearerAuthMiddleware)
             mcp_app.add_route("/health", main.handle_health, methods=["GET"])
             mcp_app.add_route(
                 "/.well-known/oauth-authorization-server",
@@ -103,6 +111,11 @@ class TestOAuthEndpoints:
             )
             mcp_app.add_route(
                 "/.well-known/oauth-protected-resource",
+                main.handle_protected_resource,
+                methods=["GET"],
+            )
+            mcp_app.add_route(
+                "/.well-known/oauth-protected-resource/mcp",
                 main.handle_protected_resource,
                 methods=["GET"],
             )
@@ -146,20 +159,31 @@ class TestOAuthEndpoints:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["resource"] == TEST_PUBLIC_BASE_URL
+        assert data["resource"] == f"{TEST_PUBLIC_BASE_URL}/mcp"
         assert TEST_PUBLIC_BASE_URL in data["authorization_servers"]
         assert "bearer_methods_supported" in data
 
-    def test_authorize_page(self, client):
-        """Test authorization page renders correctly."""
-        response = client.get(
-            "/authorize?client_id=opencode-mcp-gateway&redirect_uri=https://example.com/callback&state=abc123&scope=mcp"
-        )
+    def test_protected_resource_endpoint_mcp_suffix(self, client):
+        """Test protected resource metadata endpoint for the /mcp resource."""
+        response = client.get("/.well-known/oauth-protected-resource/mcp")
 
         assert response.status_code == 200
-        assert "Authorize Claude Code" in response.text
-        assert "opencode-mcp-gateway" in response.text
-        assert 'action="/oauth/authorize"' in response.text
+        data = response.json()
+        assert data["resource"] == f"{TEST_PUBLIC_BASE_URL}/mcp"
+        assert data["authorization_servers"] == [TEST_PUBLIC_BASE_URL]
+
+    def test_authorize_page(self, client):
+        """Test authorize endpoint auto-approves valid requests."""
+        response = client.get(
+            "/authorize?client_id=opencode-mcp-gateway&redirect_uri=https://example.com/callback&state=abc123&scope=mcp",
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 302
+        assert response.headers["location"].startswith(
+            "https://example.com/callback?code="
+        )
+        assert "state=abc123" in response.headers["location"]
 
     def test_authorize_invalid_client_id(self, client):
         """Test authorization page with invalid client_id."""
@@ -175,7 +199,8 @@ class TestOAuthEndpoints:
     ):
         """Test authorization page accepts configured additional client IDs."""
         response = client_with_allowed_client_ids.get(
-            "/authorize?client_id=claude-desktop&redirect_uri=https://example.com/callback&state=abc123&scope=mcp"
+            "/authorize?client_id=claude-desktop&redirect_uri=https://example.com/callback&state=abc123&scope=mcp",
+            follow_redirects=False,
         )
 
         assert response.status_code == 302
@@ -197,7 +222,7 @@ class TestOAuthEndpoints:
                 "code_challenge_method": "S256",
                 "scope": "mcp",
             },
-            allow_redirects=False,
+            follow_redirects=False,
         )
 
         assert response.status_code == 302
@@ -213,7 +238,7 @@ class TestOAuthEndpoints:
                 "redirect_uri": "https://example.com/callback",
                 "state": "abc123",
             },
-            allow_redirects=False,
+            follow_redirects=False,
         )
 
         assert response.status_code == 302
@@ -230,7 +255,7 @@ class TestOAuthEndpoints:
                         "code_challenge": "test-challenge",
                         "code_challenge_method": "S256",
                         "scope": "mcp",
-                        "expires": asyncio.get_event_loop().time() + 300,
+                        "expires": time.monotonic() + 300,
                     }
                 },
             ):
@@ -250,7 +275,7 @@ class TestOAuthEndpoints:
                             "code_challenge": expected_challenge,
                             "code_challenge_method": "S256",
                             "scope": "mcp",
-                            "expires": asyncio.get_event_loop().time() + 300,
+                            "expires": time.monotonic() + 300,
                         }
                     },
                 ):
@@ -296,6 +321,68 @@ class TestOAuthEndpoints:
             assert response.status_code == 400
             assert response.json()["error"] == "invalid_grant"
 
+    def test_token_rejects_redirect_uri_mismatch(self, client):
+        """Test token exchange rejects a mismatched redirect_uri."""
+        with patch.dict(
+            "main.auth_codes",
+            {
+                "test-code-123": {
+                    "client_id": "opencode-mcp-gateway",
+                    "redirect_uri": "https://example.com/callback",
+                    "resource": f"{TEST_PUBLIC_BASE_URL}/mcp",
+                    "code_challenge": "",
+                    "code_challenge_method": "S256",
+                    "scope": "mcp",
+                    "expires": time.monotonic() + 300,
+                }
+            },
+        ):
+            response = client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": "test-code-123",
+                    "client_id": "opencode-mcp-gateway",
+                    "client_secret": "test-token-12345",
+                    "redirect_uri": "https://example.com/wrong",
+                    "resource": f"{TEST_PUBLIC_BASE_URL}/mcp",
+                },
+            )
+
+            assert response.status_code == 400
+            assert response.json()["error"] == "invalid_grant"
+
+    def test_token_rejects_invalid_target_resource(self, client):
+        """Test token exchange rejects a resource not matching the MCP endpoint."""
+        with patch.dict(
+            "main.auth_codes",
+            {
+                "test-code-123": {
+                    "client_id": "opencode-mcp-gateway",
+                    "redirect_uri": "https://example.com/callback",
+                    "resource": f"{TEST_PUBLIC_BASE_URL}/mcp",
+                    "code_challenge": "",
+                    "code_challenge_method": "S256",
+                    "scope": "mcp",
+                    "expires": time.monotonic() + 300,
+                }
+            },
+        ):
+            response = client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": "test-code-123",
+                    "client_id": "opencode-mcp-gateway",
+                    "client_secret": "test-token-12345",
+                    "redirect_uri": "https://example.com/callback",
+                    "resource": "https://other.example.com/mcp",
+                },
+            )
+
+            assert response.status_code == 400
+            assert response.json()["error"] == "invalid_target"
+
     def test_token_client_credentials(self, client):
         """Test client credentials grant."""
         with patch.dict("os.environ", {"MCP_AUTH_TOKEN": "test-token-12345"}):
@@ -319,15 +406,26 @@ class TestOAuthEndpoints:
 
         assert response.status_code == 401
         assert response.json()["error"] == "invalid_token"
+        assert "WWW-Authenticate" in response.headers
+        assert "resource_metadata" in response.headers["WWW-Authenticate"]
+        assert (
+            "/.well-known/oauth-protected-resource/mcp"
+            in response.headers["WWW-Authenticate"]
+        )
 
     def test_mcp_endpoint_with_valid_token(self, client):
-        """Test MCP endpoint with valid auth token."""
+        """Test the auth middleware lets valid bearer tokens through."""
         with patch.dict("os.environ", {"MCP_AUTH_TOKEN": "test-token-12345"}):
             response = client.get(
-                "/mcp", headers={"Authorization": "Bearer test-token-12345"}
+                "/mcp",
+                headers={
+                    "Authorization": "Bearer test-token-12345",
+                    "Accept": "application/json, text/event-stream",
+                },
             )
 
-            assert response.status_code == 200
+            assert response.status_code != 401
+            assert "WWW-Authenticate" not in response.headers
 
     def test_chatgpt_oauth_flow(self, client):
         """Test full ChatGPT OAuth flow."""
@@ -338,10 +436,13 @@ class TestOAuthEndpoints:
             assert discovery_response.status_code == 200
 
             auth_response = client.get(
-                "/mcp/authorize?client_id=opencode-mcp-gateway&redirect_uri=https://chatgpt.com/callback&state=xyz"
+                "/mcp/authorize?client_id=opencode-mcp-gateway&redirect_uri=https://chatgpt.com/callback&state=xyz",
+                follow_redirects=False,
             )
-            assert auth_response.status_code == 200
-            assert "Authorize Claude Code" in auth_response.text
+            assert auth_response.status_code == 302
+            assert auth_response.headers["location"].startswith(
+                "https://chatgpt.com/callback?code="
+            )
 
             token_response = client.post(
                 "/mcp/oauth/token",
